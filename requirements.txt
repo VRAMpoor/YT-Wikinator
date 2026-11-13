@@ -1,0 +1,19 @@
+# Runtime packages for YT-Wikinator.
+
+# Transcript and audio download
+youtube-transcript-api>=1.0
+yt-dlp>=2024.10.0
+requests>=2.31.0
+
+# Reads a transcript from the YouTube page in a real browser (the installed
+# Microsoft Edge): the first way tried for every video. Optional; without it
+# the direct request is used.
+playwright>=1.40
+
+# Local Whisper transcription (only used for videos without captions)
+faster-whisper>=1.0.0
+
+# NVIDIA runtime libraries that faster-whisper needs to run on the GPU.
+# Without them Whisper still works, but on the CPU.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

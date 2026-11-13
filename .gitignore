@@ -1,0 +1,78 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# SQLite Databases & WAL (protects private data and avoids publishing full-text transcripts)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Large Model Weights (>100MB)
+*.gguf
+*.bin
+*.pt
+*.safetensors
+*.onnx
+
+# Compressed archives & large packages
+*.7z
+*.zip
+*.tar.gz
+*.tar
+
+# Proprietary runtime libraries & external executables
+*.dll
+*.so
+*.dylib
+ffmpeg.exe
+yt-dlp.exe
+llama-server.exe
+
+# Python bytecode & environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Transcripts & temporary media
+*.vtt
+*.srt
+*.webm
+*.mp3
+*.mp4
+*.wav
+*.tmp
+.tmp*
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Runtime logs written by the Control Center
+/logs/
+
+# Downloaded by the setup check (engine, CUDA runtime, partial downloads) and local data
+/bin/
+/downloads/
+/data/
+/ytc.exe
+
+# Downloaded model files
+/models/
+
+# Partial download of the ready-made engine
+/ytc.exe.part
+
+# Stale wiki pages moved aside by "ytc wiki --prune"
+/wiki/.ytc-pruned/
+
+# The wiki is created by the app from your own library: never published
+/wiki/*
+!/wiki/.gitkeep

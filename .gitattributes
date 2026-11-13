@@ -1,0 +1,8 @@
+# Windows launch scripts are stored with CRLF line endings exactly as they are,
+# so that a ZIP downloaded from GitHub contains working .bat files.
+*.bat -text
+*.ps1 -text
+
+# Never touch binary files.
+*.gguf binary
+*.ico binary

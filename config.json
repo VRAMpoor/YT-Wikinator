@@ -1,0 +1,22 @@
+{
+  "llm": {
+    "server_binary": "bin/llama/llama-server.exe",
+    "model_path": "models/Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+    "port": 8080,
+    "gpu_layers": 99,
+    "context_size": 8192,
+    "reasoning": false
+  },
+  "ytc": {
+    "binary": "target/release/ytc.exe",
+    "port": 8088,
+    "db_path": "data/ytc.db",
+    "wiki_dir": "wiki"
+  },
+  "crawler": {
+    "search_depth": 3,
+    "delay_seconds": 10,
+    "max_slop_score": 45,
+    "watch_interval_minutes": 60
+  }
+}
