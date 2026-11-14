@@ -2382,6 +2382,8 @@ async fn run_watch_loop(pipeline: &IngestionPipeline, options: &WatchOptions) ->
         // one transcript from YouTube (or ran Whisper) before it noticed, and did
         // so again in every cycle while the LLM stayed down.
         let mut llm_down = false;
+        // Another crawl holds this library: nothing of this cycle may run next to it.
+        let mut crawl_busy = false;
         if pipeline.analyzer.has_llm() {
             let Some(reachable) = run_unless_stopped(&stop, pipeline.analyzer.llm_reachable()).await else {
                 break 'watch;
@@ -2404,10 +2406,13 @@ async fn run_watch_loop(pipeline: &IngestionPipeline, options: &WatchOptions) ->
             };
             match result {
                 Ok(summary) => println!("  Cycle #{} crawl: {}", cycle, crawl_summary_line(&summary)),
-                Err(e) if pipeline::is_crawl_busy(&e) => println!(
-                    "  {} Another crawl is running on this library: crawl skipped in this cycle.",
-                    "↻".dimmed()
-                ),
+                Err(e) if pipeline::is_crawl_busy(&e) => {
+                    crawl_busy = true;
+                    println!(
+                        "  {} Another crawl is running on this library: crawl skipped in this cycle.",
+                        "↻".dimmed()
+                    );
+                }
                 Err(e) => {
                     println!("  {} Crawl ended with an error: {:#}", "⚠".yellow(), e);
                     llm_down = is_llm_unavailable(&e);
@@ -2418,6 +2423,9 @@ async fn run_watch_loop(pipeline: &IngestionPipeline, options: &WatchOptions) ->
         // 2. Discovery, pointless while the LLM is down.
         if options.discover && llm_down {
             println!("  Discovery skipped in this cycle: the LLM is not available.");
+        } else if options.discover && crawl_busy {
+            // It would share the one LLM engine with the running crawl.
+            println!("  Discovery skipped in this cycle: another crawl is running.");
         } else if options.discover {
             for q in &options.queries {
                 println!("\n{} Discovery query: '{}'", "🔍".cyan(), q);
@@ -2448,6 +2456,15 @@ async fn run_watch_loop(pipeline: &IngestionPipeline, options: &WatchOptions) ->
             stop.acknowledged.store(true, Ordering::SeqCst);
             break 'watch;
         }
+        // Asked again here: a crawl may have started while this cycle was working.
+        // Two writers of the same wiki folder are never wanted. Nothing is lost:
+        // the next cycle writes the wiki, and so does a crawl started with it.
+        if crawl_busy || pipeline::another_crawl_is_running(&pipeline.db_path) {
+            println!(
+                "\n  {} Wiki not written in this cycle: another crawl is running. The next cycle writes it.",
+                "↻".dimmed()
+            );
+        } else {
         println!("\n{} Writing the wiki to {:?} ...", "📚".cyan(), options.wiki_dir);
         stop.writing_wiki.store(true, Ordering::SeqCst);
         let written = pipeline
@@ -2470,6 +2487,7 @@ async fn run_watch_loop(pipeline: &IngestionPipeline, options: &WatchOptions) ->
                 }
             }
             Err(e) => println!("  {} The wiki could not be written: {:#}", "⚠".yellow(), e),
+        }
         }
 
         let wait = std::time::Duration::from_secs(options.interval_minutes.saturating_mul(60));

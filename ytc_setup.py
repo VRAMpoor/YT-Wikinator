@@ -90,14 +90,14 @@ RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
 # ready-made program is published for this version: nothing is downloaded,
 # because an unverified exe must never be fetched and run, and ytc.exe is
 # built from source instead.
-YTC_RELEASE_TAG = "v0.1.1"
+YTC_RELEASE_TAG = "v0.1.2"
 # What 'ytc.exe --version' must print for this app: the launcher and ytc.exe
 # belong to one release and work as a pair.
 YTC_VERSION = YTC_RELEASE_TAG.lstrip("v")
 YTC_EXE_NAME = "ytc.exe"
 YTC_EXE_URL = f"https://github.com/{GITHUB_REPO}/releases/download/{YTC_RELEASE_TAG}/{YTC_EXE_NAME}"
 YTC_EXE_SIZE = 12410368
-YTC_EXE_SHA256 = "0a0c67d66e46aeb5dba8b6af7e0f9965bdcb5511ec260a7df0680c0097dd0cf8"
+YTC_EXE_SHA256 = "07550b95089f1d64df9bfe5dad7c2126d5b332b0e5c725f39922ab2cf8048090"
 
 # (import name, pip requirement). A '>=' in the requirement is a real minimum:
 # the check compares the installed version with it (see missing_pip_packages).

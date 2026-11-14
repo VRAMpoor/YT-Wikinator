@@ -299,6 +299,12 @@ pub fn is_crawl_busy(err: &anyhow::Error) -> bool {
     err.to_string() == CRAWL_BUSY_MESSAGE
 }
 
+/// True while a crawl holds the library of `db_path`. Only a look: the lock
+/// is given back at once.
+pub fn another_crawl_is_running(db_path: &Path) -> bool {
+    crawl_lock(db_path).is_err()
+}
+
 /// Takes the crawl lock of a library: the file `crawl.lock` next to the
 /// database, locked for as long as the returned file is kept. The operating
 /// system releases it when the program ends, however it ends. Ok(None) when
@@ -2575,11 +2581,14 @@ mod tests {
         let refused = crawl_lock(&db_path).expect_err("held by the first crawl");
         assert!(refused.to_string().starts_with("Not started: another crawl is running"), "{}", refused);
         assert!(is_crawl_busy(&refused));
+        assert!(another_crawl_is_running(&db_path));
         assert!(!is_crawl_busy(&anyhow::anyhow!("LLM engine not available")));
         // Another library is not affected.
         let other = tempfile::tempdir().expect("temp dir");
+        assert!(!another_crawl_is_running(&other.path().join("ytc.db")));
         assert!(crawl_lock(&other.path().join("ytc.db")).expect("free").is_some());
         drop(first);
+        assert!(!another_crawl_is_running(&db_path));
         assert!(crawl_lock(&db_path).expect("free again").is_some());
         // No folder for the lock file: the crawl is not refused for that.
         assert!(crawl_lock(&dir.path().join("missing").join("ytc.db")).expect("not refused").is_none());

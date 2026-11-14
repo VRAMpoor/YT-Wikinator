@@ -190,11 +190,11 @@ python ytc_setup.py --install    # download and install everything missing
 python ytc_setup.py --self-test  # built-in checks of the setup logic (no network)
 ```
 
-`Launch_ControlCenter.bat` and `Start_All.bat` start the app without the icon. `Stop_All.bat` stops both services. `Open_WebUI.bat` opens the web UI on the port from `config.json` (`ytc.port`).
+`Launch_ControlCenter.bat` and `Start_All.bat` start the app without the icon. `Stop_All.bat` stops both services; when a crawl or another long job is still running, it says so and asks first. `Open_WebUI.bat` opens the web UI on the port from `config.json` (`ytc.port`).
 
 - **Everything is inside the app folder.** The Control Center looks for `llama-server.exe` in `bin/llama`, for the model in `models/`, and for `ytc.exe` in `target/release` and then in the app folder itself. A path in `config.json` is tried first; a relative path there means inside the app folder. No other folder on the PC is searched.
 - If something does not start, the reason is in the log pane and in `logs/control_center.log`, `logs/llama-server.log` and `logs/ytc-server.log`.
-- **`ytc.exe` and the launcher belong together.** The Control Center and the setup check compare what `ytc.exe --version` prints with the version of the app (0.1.1). A `ytc.exe` that does not match is reported in the setup check and in the log (`found X, need Y`), and the Control Center does not start it. If `ytc.exe --version` itself fails (for example while an antivirus program scans the file), that error is shown and nothing is said about the version; the next action asks again. To replace a `ytc.exe` that does not match: stop the web server and any crawl, press **SETUP CHECK** and use the install button, or run `python ytc_setup.py --install`. By hand: `cargo build --release`.
+- **`ytc.exe` and the launcher belong together.** The Control Center and the setup check compare what `ytc.exe --version` prints with the version of the app (0.1.2). A `ytc.exe` that does not match is reported in the setup check and in the log (`found X, need Y`), and the Control Center does not start it. If `ytc.exe --version` itself fails (for example while an antivirus program scans the file), that error is shown and nothing is said about the version; the next action asks again. To replace a `ytc.exe` that does not match: stop the web server and any crawl, press **SETUP CHECK** and use the install button, or run `python ytc_setup.py --install`. By hand: `cargo build --release`.
 
 ### In the Control Center
 
