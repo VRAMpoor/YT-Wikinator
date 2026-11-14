@@ -290,6 +290,31 @@ fn channel_is_gone(list_error: &str) -> bool {
     list_error.contains("This channel does not exist")
 }
 
+/// What a crawl answers when another one holds the library.
+const CRAWL_BUSY_MESSAGE: &str = "Not started: another crawl is running on this library (started from the Control Center, the web page or 'ytc watch'). Wait until it has ended.";
+
+/// True when a crawl was not started because another one holds the library.
+/// That is a refusal, not a failure of the crawl.
+pub fn is_crawl_busy(err: &anyhow::Error) -> bool {
+    err.to_string() == CRAWL_BUSY_MESSAGE
+}
+
+/// Takes the crawl lock of a library: the file `crawl.lock` next to the
+/// database, locked for as long as the returned file is kept. The operating
+/// system releases it when the program ends, however it ends. Ok(None) when
+/// the lock file cannot be used at all: a crawl is not refused for that.
+fn crawl_lock(db_path: &Path) -> Result<Option<std::fs::File>> {
+    let path = db_path.with_file_name("crawl.lock");
+    let Ok(file) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path) else {
+        return Ok(None);
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(anyhow::anyhow!(CRAWL_BUSY_MESSAGE)),
+        Err(std::fs::TryLockError::Error(_)) => Ok(None),
+    }
+}
+
 /// How many more videos than the crawl takes per channel are read from a
 /// channel's video list: Shorts and known videos are sorted out afterwards.
 const CHANNEL_LIST_EXTRA: usize = 5;
@@ -1567,6 +1592,10 @@ impl IngestionPipeline {
         delay_secs: u64,
         wiki_dir: Option<&Path>,
     ) -> Result<CrawlSummary> {
+        // One crawl per library at a time, also across programs (Control
+        // Center, `ytc watch`, the web page): they share one LLM engine and one
+        // pacing memory. Held until this function returns.
+        let _crawl_lock = crawl_lock(&self.db_path)?;
         let db = self.db()?;
         let channels = if let Some(target) = channel_filter {
             let target = target.trim().to_string();
@@ -1672,7 +1701,8 @@ impl IngestionPipeline {
                     // YouTube's feed address fails for stretches of time, with 404
                     // or 500, also for channels that exist: the channel's video
                     // list is read with yt-dlp instead.
-                    println!("  {} Feed not fetched ({:#}). Reading the channel's video list instead...", "↻".yellow(), feed_err);
+                    // Not an error yet: the reason is shown only if the list fails too.
+                    println!("  {} YouTube's feed gave no answer for this channel. Reading its video list instead...", "↻".dimmed());
                     let extractor = self.extractor.clone();
                     let channel_id = ch.id.clone();
                     let wanted = limit_per_channel.saturating_add(CHANNEL_LIST_EXTRA);
@@ -2535,6 +2565,24 @@ mod tests {
         ));
         assert!(!channel_is_gone("the video list was empty"));
         assert!(!channel_is_gone("ERROR: Unable to download API page: HTTP Error 404: Not Found"));
+    }
+
+    #[test]
+    fn a_second_crawl_on_the_same_library_is_refused_until_the_first_ends() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("ytc.db");
+        let first = crawl_lock(&db_path).expect("free").expect("lock file usable");
+        let refused = crawl_lock(&db_path).expect_err("held by the first crawl");
+        assert!(refused.to_string().starts_with("Not started: another crawl is running"), "{}", refused);
+        assert!(is_crawl_busy(&refused));
+        assert!(!is_crawl_busy(&anyhow::anyhow!("LLM engine not available")));
+        // Another library is not affected.
+        let other = tempfile::tempdir().expect("temp dir");
+        assert!(crawl_lock(&other.path().join("ytc.db")).expect("free").is_some());
+        drop(first);
+        assert!(crawl_lock(&db_path).expect("free again").is_some());
+        // No folder for the lock file: the crawl is not refused for that.
+        assert!(crawl_lock(&dir.path().join("missing").join("ytc.db")).expect("not refused").is_none());
     }
 
     #[test]

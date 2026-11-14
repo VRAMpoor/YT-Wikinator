@@ -248,9 +248,18 @@ fn auto_status_change_notice(
     if status_before == new_status {
         return None;
     }
+    // The way back depends on the change: `set-status` offers active and muted
+    // only, so a lost high_signal cannot be set by hand.
+    let way_back = match (status_before, new_status) {
+        ("muted", _) => format!("undo with: ytc set-status {} muted", channel_id),
+        ("high_signal", "active") => {
+            "high_signal cannot be set by hand; it returns when the average is low enough again".to_string()
+        }
+        _ => format!("undo with: ytc set-status {} active", channel_id),
+    };
     Some(format!(
-        "Channel status changed automatically: {} ({}) {} -> {} (average slop {:.1}/100 over the last {} scored video(s)); undo with: ytc set-status {} active",
-        title, channel_id, status_before, new_status, avg, scored, channel_id
+        "Channel status changed automatically: {} ({}) {} -> {} (average slop {:.1}/100 over the last {} scored video(s)); {}",
+        title, channel_id, status_before, new_status, avg, scored, way_back
     ))
 }
 
@@ -2465,6 +2474,17 @@ mod tests {
         assert!(notice.contains("82.4/100"), "{}", notice);
         assert!(notice.contains("5 scored video(s)"), "{}", notice);
         assert!(notice.ends_with("undo with: ytc set-status UC1 active"), "{}", notice);
+        // Each kind of change names a way back that really undoes it.
+        let hint = |before: &str, after: &str| {
+            auto_status_change_notice("UC1", "Some Channel", before, after, 50.0, 5).expect("a change is announced")
+        };
+        assert!(hint("active", "high_signal").ends_with("undo with: ytc set-status UC1 active"));
+        assert!(hint("high_signal", "muted").ends_with("undo with: ytc set-status UC1 active"));
+        assert!(hint("muted", "active").ends_with("undo with: ytc set-status UC1 muted"));
+        assert!(hint("muted", "high_signal").ends_with("undo with: ytc set-status UC1 muted"));
+        let demoted = hint("high_signal", "active");
+        assert!(!demoted.contains("undo with"), "{}", demoted);
+        assert!(demoted.ends_with("it returns when the average is low enough again"), "{}", demoted);
 
         assert_eq!(auto_status_change_notice("UC1", "Some Channel", "muted", "muted", 82.4, 5), None);
     }

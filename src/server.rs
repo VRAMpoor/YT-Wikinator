@@ -72,6 +72,23 @@ impl JobSlot {
             Err(held) => Err(busy_message(JobKind::from_code(held), kind)),
         }
     }
+
+    /// The job that holds the slot right now, if any.
+    fn running(&self) -> Option<JobKind> {
+        JobKind::from_code(self.0.load(Ordering::SeqCst))
+    }
+}
+
+/// Answer of GET /api/job: `running` names the long job of this server
+/// ("a crawl", ...) or is null. Asked by the Control Center before it stops
+/// the server or the LLM engine, so a job started from the web page is not
+/// cut off without a question.
+fn job_json(running: Option<JobKind>) -> serde_json::Value {
+    serde_json::json!({ "running": running.map(JobKind::label) })
+}
+
+async fn handle_job(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(job_json(state.jobs.running()))
 }
 
 /// Refusal text when `wanted` cannot start because `running` holds the slot.
@@ -225,6 +242,7 @@ fn app_router(state: Arc<AppState>, port: u16) -> Router {
     Router::new()
         .route("/", get(handle_index))
         .route("/api/status", get(handle_status))
+        .route("/api/job", get(handle_job))
         .route("/api/insights", get(handle_get_insights))
         .route("/api/insights/:video_id/exclude", post(handle_exclude_video))
         .route("/api/insights/:video_id/include", post(handle_include_video))
@@ -5549,6 +5567,16 @@ mod tests {
         assert_eq!(j["status"], "error");
         assert_eq!(j["busy"], true);
         assert_eq!(j["message"], "m");
+    }
+
+    #[test]
+    fn the_running_job_is_reported_until_its_guard_is_dropped() {
+        let slot = Arc::new(JobSlot::default());
+        assert!(job_json(slot.running())["running"].is_null());
+        let guard = slot.try_claim(JobKind::Crawl).unwrap();
+        assert_eq!(job_json(slot.running())["running"], "a crawl");
+        drop(guard);
+        assert!(job_json(slot.running())["running"].is_null());
     }
 
     #[test]

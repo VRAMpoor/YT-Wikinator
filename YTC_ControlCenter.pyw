@@ -300,6 +300,19 @@ def check_http_alive(url, timeout=2.0):
         return False
 
 
+def web_job_running(port, timeout=1.5):
+    """The long job the web server runs right now ("a crawl", ...), or None.
+    None also when the server is down or too old to know the question."""
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/job",
+                                     headers={"User-Agent": "YTC-ControlCenter"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            running = json.loads(resp.read().decode("utf-8")).get("running")
+        return running if isinstance(running, str) and running else None
+    except Exception:
+        return None
+
+
 def run_quiet(cmd, timeout=20):
     """Run a short helper command with no console window; returns stdout text."""
     try:
@@ -1093,7 +1106,38 @@ class YTCControlApp:
         self.model_entry.delete(0, "end")
         self.model_entry.insert(0, path_text)
 
+    def _running_work(self):
+        """What is working right now, as (from this window, from the web page).
+        The second one is the web server's own job ("a crawl", ...) or None."""
+        with self._jobs_lock:
+            local = any(p.poll() is None for p in self._jobs)
+        _, ytc_port = self._ports()
+        return local, web_job_running(ytc_port)
+
+    def _confirm_stop(self, stops_engine, stops_web):
+        """Ask before a stop cuts off running work. Main thread."""
+        local, web = self._running_work()
+        lines = []
+        if stops_engine and local:
+            lines.append("A crawl, auto-crawl, video ingest or re-analysis started from this window "
+                         "is still running. It needs the LLM engine: without it, it ends early.")
+        if web and stops_web:
+            lines.append(f"The web page has started {web}. It runs inside the web server: "
+                         "stopping the web server aborts it.")
+        elif web and stops_engine:
+            lines.append(f"The web page has started {web}. It needs the LLM engine: "
+                         "without it, it ends early.")
+        if not lines:
+            return True
+        return messagebox.askokcancel(
+            "Work still running", "\n\n".join(lines) + "\n\nStop anyway?",
+            icon="warning", default="cancel")
+
     def stop_llm_server(self):
+        if self._confirm_stop(stops_engine=True, stops_web=False):
+            self._stop_llm_now()
+
+    def _stop_llm_now(self):
         self._llm_stop_gen += 1
         proc, self.llama_proc = self.llama_proc, None
         llm_port, _ = self._ports()
@@ -1296,6 +1340,10 @@ class YTCControlApp:
             self.log(f"⚠️ Could not read {log_path}: {e}")
 
     def stop_ytc_server(self):
+        if self._confirm_stop(stops_engine=False, stops_web=True):
+            self._stop_ytc_now()
+
+    def _stop_ytc_now(self):
         self._ytc_stop_gen += 1
         proc, self.ytc_proc = self.ytc_proc, None
         _, ytc_port = self._ports()
@@ -1317,8 +1365,10 @@ class YTCControlApp:
         threading.Thread(target=_web, daemon=True).start()
 
     def stop_all_services(self):
-        self.stop_ytc_server()
-        self.stop_llm_server()
+        if not self._confirm_stop(stops_engine=True, stops_web=True):
+            return
+        self._stop_ytc_now()
+        self._stop_llm_now()
 
     def open_web_ui(self):
         _, ytc_port = self._ports()
@@ -1347,6 +1397,10 @@ class YTCControlApp:
                 "Cancel = keep the Control Center open",
             )
             if answer is None:
+                return
+            # Jobs of this window were asked about above; this is about the web page's job.
+            if answer and web_job_running(self._ports()[1]) and not self._confirm_stop(
+                    stops_engine=False, stops_web=True):
                 return
             stop_services = answer
         self.is_monitoring = False

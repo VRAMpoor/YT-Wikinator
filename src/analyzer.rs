@@ -651,6 +651,17 @@ Keep, as plain text:
 - At most one line starting "QUOTE:", copied unchanged from the notes.
 Do not score or judge the video. At most 200 words."#;
 
+/// How long a request waits for an engine that is still loading its model.
+/// 0 in tests: they must not wait for a server that never becomes ready.
+const ENGINE_LOADING_WAIT_SECS: u64 = if cfg!(test) { 0 } else { 120 };
+
+/// True for the error `chat_once` returns when the engine answered HTTP 503:
+/// llama-server does that while the model is loading.
+fn is_model_loading(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<LlmUnavailable>()
+        .is_some_and(|u| u.engine_down && u.reason.contains("answered with a server error 503"))
+}
+
 /// Health endpoint of an OpenAI-compatible base URL: llama-server serves
 /// `/health` next to `/v1`, not below it.
 fn health_url(base_url: &str) -> String {
@@ -1184,7 +1195,35 @@ impl VideoAnalyzer {
     /// One chat-completions request. `json` asks the server for a JSON object.
     /// Returns `LlmUnavailable` when the engine is down, loading, timed out or
     /// misconfigured; a plain error for anything specific to this request.
+    ///
+    /// An engine that is still loading its model (llama-server: HTTP 503) is
+    /// waited for, up to `ENGINE_LOADING_WAIT_SECS`, and asked once more: a
+    /// crawl started a few seconds after the engine must not end for that.
     async fn chat(&self, base_url: &str, system: &str, user: String, max_tokens: u32, json: bool) -> Result<ChatAnswer> {
+        match self.chat_once(base_url, system, user.clone(), max_tokens, json).await {
+            Err(e) if is_model_loading(&e) && ENGINE_LOADING_WAIT_SECS > 0 => {
+                println!(
+                    "    {} The LLM engine is still loading its model. Waiting up to {} s ...",
+                    "⏳".dimmed(),
+                    ENGINE_LOADING_WAIT_SECS
+                );
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ENGINE_LOADING_WAIT_SECS);
+                loop {
+                    if self.llm_reachable().await {
+                        return self.chat_once(base_url, system, user, max_tokens, json).await;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// One request, no waiting (see `chat`).
+    async fn chat_once(&self, base_url: &str, system: &str, user: String, max_tokens: u32, json: bool) -> Result<ChatAnswer> {
         let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         // From connecting until the last byte of the answer.
         let timeout = self.timeout_for(system.len() + user.len());
@@ -1693,6 +1732,27 @@ mod tests {
             stripped_segments_count: 0,
             text: text.to_string(),
         }
+    }
+
+    #[test]
+    fn only_a_loading_engine_is_waited_for() {
+        let loading = anyhow::Error::new(LlmUnavailable {
+            engine_down: true,
+            reason: "http://x/v1/chat/completions answered with a server error 503: Loading model".to_string(),
+        });
+        assert!(is_model_loading(&loading));
+        // Nothing listens (stopped engine): waiting would only delay the stop.
+        let stopped = anyhow::Error::new(LlmUnavailable {
+            engine_down: true,
+            reason: "http://x/v1/chat/completions - connection refused".to_string(),
+        });
+        assert!(!is_model_loading(&stopped));
+        let broken = anyhow::Error::new(LlmUnavailable {
+            engine_down: false,
+            reason: "http://x/v1/chat/completions answered with a server error 500: boom".to_string(),
+        });
+        assert!(!is_model_loading(&broken));
+        assert!(!is_model_loading(&anyhow::anyhow!("answered with a server error 503")));
     }
 
     #[test]

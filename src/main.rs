@@ -2404,6 +2404,10 @@ async fn run_watch_loop(pipeline: &IngestionPipeline, options: &WatchOptions) ->
             };
             match result {
                 Ok(summary) => println!("  Cycle #{} crawl: {}", cycle, crawl_summary_line(&summary)),
+                Err(e) if pipeline::is_crawl_busy(&e) => println!(
+                    "  {} Another crawl is running on this library: crawl skipped in this cycle.",
+                    "↻".dimmed()
+                ),
                 Err(e) => {
                     println!("  {} Crawl ended with an error: {:#}", "⚠".yellow(), e);
                     llm_down = is_llm_unavailable(&e);
