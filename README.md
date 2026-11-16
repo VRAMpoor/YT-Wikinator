@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![VRAM Friendly](https://img.shields.io/badge/VRAM-Runs%20on%208%20GB%20GPU-brightgreen.svg)]()
 [![Rust](https://img.shields.io/badge/Rust-2021%20Edition-orange.svg)](https://www.rust-lang.org/)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.10--3.14-green.svg)](https://www.python.org/)
 [![Inference](https://img.shields.io/badge/Local%20LLM-llama.cpp%20%7C%20CUDA-purple.svg)](https://github.com/PrismML-Eng/llama.cpp)
 [![Privacy](https://img.shields.io/badge/Privacy-Analysis%20runs%20locally-brightgreen.svg)](#-privacy-what-leaves-your-machine)
 
@@ -159,7 +159,7 @@ flowchart TD
 
 - Windows 10 or 11 (the Control Center and the setup check are Windows-only; the `ytc` command line also builds on Linux/macOS, but that is untested)
 - NVIDIA graphics card with 8 GB VRAM or more, driver 551.61 or newer
-- Python 3.10 or newer with Tk (the python.org installer or the Microsoft Store Python), with `pythonw.exe` on `PATH`
+- Python 3.10 to 3.14 with Tk (the python.org installer or the Microsoft Store Python), with `pythonw.exe` on `PATH`. Python 3.15 is not supported yet: faster-whisper needs onnxruntime, which had no Windows build for Python 3.15 (checked 2026-11-16). On 3.15 the app runs, but videos that must be transcribed locally (no captions, or YouTube refuses the transcript) fail.
 - [Rust](https://rustup.rs/) only if you build `ytc.exe` yourself. The setup prefers the ready-made `ytc.exe` from this project's GitHub release. That file is not code-signed, so Windows or an antivirus program may show a warning; the setup checks it against a pinned SHA-256 before using it, and you can always build it from source instead.
 
 ---
@@ -208,7 +208,7 @@ The app folder is the whole app. Copy the complete folder: `data/` (your databas
 
 1. Copy the folder to the other PC.
 2. Run `Create_Desktop_Shortcut.bat` there again.
-3. Python 3.10 or newer and a current NVIDIA driver must be installed on that PC. The setup check installs the Python packages and reports anything else that is missing.
+3. Python 3.10 to 3.14 and a current NVIDIA driver must be installed on that PC. The setup check installs the Python packages and reports anything else that is missing.
 
 Paths inside the app folder are stored in `config.json` as relative paths, so nothing has to be changed after the move.
 

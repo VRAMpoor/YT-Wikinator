@@ -1964,31 +1964,22 @@ class SetupDialog:
         self.win = tk.Toplevel(app.root)
         self.win.title("YTC Setup Check")
         self.win.configure(bg=app.bg_dark)
-        self.win.geometry("820x720")
-        self.win.minsize(700, 560)
+        # A transient window has no maximize button, so what does not fit stays
+        # hidden unless the user drags the edge. Keep it inside the screen
+        # (minus room for the title bar and the taskbar).
+        self._max_h = max(400, self.win.winfo_screenheight() - 90)
+        self._height = min(720, self._max_h)
+        self.win.geometry(f"820x{self._height}")
+        self.win.minsize(700, min(560, self._max_h))
         self.win.transient(app.root)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
-        tk.Label(self.win, text="🧰 Setup Check", font=("Segoe UI", 13, "bold"),
-                 fg=app.fg_bright, bg=app.bg_dark).pack(anchor="w", padx=14, pady=(12, 0))
-        self.summary_lbl = tk.Label(self.win, text="", font=("Segoe UI", 9), fg=app.fg_dim, bg=app.bg_dark,
-                                    justify="left", wraplength=780)
-        self.summary_lbl.pack(anchor="w", padx=14, pady=(2, 8))
-
-        self.rows = tk.Frame(self.win, bg=app.bg_card, bd=1, relief="solid")
-        self.rows.pack(fill="x", padx=14)
-
-        self.progress = ttk.Progressbar(self.win, mode="determinate", maximum=1000)
-        self.progress.pack(fill="x", padx=14, pady=(10, 2))
-        self.status_lbl = tk.Label(self.win, text="", font=("Segoe UI", 8), fg=app.fg_dim, bg=app.bg_dark, anchor="w")
-        self.status_lbl.pack(fill="x", padx=14)
-
-        self.log_text = tk.Text(self.win, bg="#05070a", fg="#7ee787", font=("Consolas", 8), height=8,
-                                wrap="word", relief="flat")
-        self.log_text.pack(fill="both", expand=True, padx=14, pady=(6, 8))
-
+        # The buttons are packed first, at the bottom: the packer hands out
+        # space in packing order, so when the content is taller than the window
+        # the log shrinks, not the button row (a fresh PC needs 764 px, more
+        # than the 720 px window, and the Install button was cut off).
         btns = tk.Frame(self.win, bg=app.bg_dark)
-        btns.pack(fill="x", padx=14, pady=(0, 12))
+        btns.pack(side="bottom", fill="x", padx=14, pady=(0, 12))
         self.btn_install = tk.Button(btns, text="", font=("Segoe UI", 9, "bold"), bg="#238636", fg="#ffffff",
                                      activebackground="#2ea043", activeforeground="#ffffff", relief="flat",
                                      padx=12, pady=5, command=self.start_install)
@@ -1999,8 +1990,41 @@ class SetupDialog:
         self.btn_close = tk.Button(btns, text="Close", font=("Segoe UI", 9), bg="#21262d", fg=app.fg_bright,
                                    relief="flat", padx=12, pady=5, command=self.close)
         self.btn_close.pack(side="right")
+        # Progress bar and status line sit just above the buttons, for the same
+        # reason: on a small screen (1080p at 150% leaves this DPI-unaware app
+        # 720 px of screen) they stay visible while the log shrinks.
+        self.status_lbl = tk.Label(self.win, text="", font=("Segoe UI", 8), fg=app.fg_dim, bg=app.bg_dark, anchor="w")
+        self.status_lbl.pack(side="bottom", fill="x", padx=14, pady=(0, 6))
+        self.progress = ttk.Progressbar(self.win, mode="determinate", maximum=1000)
+        self.progress.pack(side="bottom", fill="x", padx=14, pady=(0, 2))
+
+        tk.Label(self.win, text="🧰 Setup Check", font=("Segoe UI", 13, "bold"),
+                 fg=app.fg_bright, bg=app.bg_dark).pack(anchor="w", padx=14, pady=(12, 0))
+        self.summary_lbl = tk.Label(self.win, text="", font=("Segoe UI", 9), fg=app.fg_dim, bg=app.bg_dark,
+                                    justify="left", wraplength=780)
+        self.summary_lbl.pack(anchor="w", padx=14, pady=(2, 8))
+
+        self.rows = tk.Frame(self.win, bg=app.bg_card, bd=1, relief="solid")
+        self.rows.pack(fill="x", padx=14)
+
+        self.log_text = tk.Text(self.win, bg="#05070a", fg="#7ee787", font=("Consolas", 8), height=8,
+                                wrap="word", relief="flat")
+        self.log_text.pack(fill="both", expand=True, padx=14, pady=(10, 8))
 
         self.render()
+        self._fit_height()
+
+    def _fit_height(self):
+        """Grow the window when the content wants more than its height, up to
+        the screen height, so that the log keeps a few visible lines."""
+        try:
+            self.win.update_idletasks()
+            want = min(self.win.winfo_reqheight(), self._max_h)
+            if want > self._height:
+                self._height = want
+                self.win.geometry(f"820x{want}")
+        except tk.TclError:
+            pass
 
     def alive(self):
         try:

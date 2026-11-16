@@ -467,12 +467,49 @@ def check_gpu_whisper() -> Item:
                 "videos without captions can be transcribed on the graphics card", required=False)
 
 
+# The newest Python every package above has a Windows build for (checked on
+# PyPI 2026-11-16). faster-whisper needs onnxruntime, and onnxruntime 1.32.0
+# has Windows wheels for Python 3.11-3.14 only and no source package, so pip
+# cannot install faster-whisper on Python 3.15. Newer onnxruntime releases may
+# fix that, so a newer Python is still tried; only the message explains it.
+NEWEST_TESTED_PYTHON = (3, 14)
+PYTHON_DOWNLOAD_URL = "https://www.python.org/downloads/windows/"
+
+
+def python_version() -> Tuple[int, int]:
+    """(major, minor) of python_exe(), the Python the packages go into."""
+    code, out = _run([str(python_exe()), "-c", "import sys; print('%d.%d' % sys.version_info[:2])"], timeout=30)
+    try:
+        major, minor = out.strip().split(".")
+        if code == 0:
+            return int(major), int(minor)
+    except ValueError:
+        pass
+    return sys.version_info[0], sys.version_info[1]
+
+
+def too_new_python_hint(missing: List[str]) -> str:
+    """An explanation when faster-whisper is missing on a Python newer than
+    NEWEST_TESTED_PYTHON (empty otherwise)."""
+    version = python_version()
+    if version <= NEWEST_TESTED_PYTHON or not any(r.startswith("faster-whisper") for r in missing):
+        return ""
+    newest = "%d.%d" % NEWEST_TESTED_PYTHON
+    return (f" This is Python {version[0]}.{version[1]}: faster-whisper needs onnxruntime, which had no Windows "
+            f"build for it yet (checked 2026-11-16). Install Python {newest} from python.org and start the "
+            f"app with it. Without faster-whisper the app still runs; only videos that must be transcribed "
+            f"locally (no captions, or YouTube refuses the transcript) fail.")
+
+
 def check_python_packages() -> Item:
     missing = missing_pip_packages()
     if not missing:
         return Item("pip", "Python packages", True, "yt-dlp, faster-whisper, youtube-transcript-api, requests")
-    return Item("pip", "Python packages", False, "missing or below the minimum version: " + ", ".join(missing),
-                can_install=True, download_bytes=250 * 1000 * 1000)
+    hint = too_new_python_hint(missing)
+    return Item("pip", "Python packages", False,
+                "missing or below the minimum version: " + ", ".join(missing) + "." + hint,
+                can_install=True, download_bytes=250 * 1000 * 1000,
+                help_url=PYTHON_DOWNLOAD_URL if hint else "")
 
 
 def check_llama(cfg: dict) -> Item:
@@ -978,11 +1015,19 @@ def install_pip(log: LogFn, progress: Optional[ProgressFn], cancel: Optional[thr
     if not missing:
         return
     log("Installing Python packages: " + ", ".join(missing))
-    # --upgrade: a package that is installed but below its minimum version is in the list too.
-    code = _stream([str(python_exe()), "-m", "pip", "install", "--upgrade", "--disable-pip-version-check"] + missing,
-                   log, cancel)
-    if code != 0:
-        raise SetupError("pip could not install the Python packages (see the lines above).")
+    # One pip call per package: pip installs nothing when one requirement of a
+    # call fails, and faster-whisper fails on a Python without onnxruntime
+    # builds, which would also take yt-dlp and the others down with it.
+    failed = []
+    for requirement in missing:
+        # --upgrade: a package that is installed but below its minimum version is in the list too.
+        code = _stream([str(python_exe()), "-m", "pip", "install", "--upgrade", "--disable-pip-version-check",
+                        requirement], log, cancel)
+        if code != 0:
+            failed.append(requirement)
+    if failed:
+        raise SetupError("pip could not install " + ", ".join(failed) + " (see the lines above)."
+                         + too_new_python_hint(failed))
 
 
 def install_pip_gpu(log: LogFn, progress: Optional[ProgressFn], cancel: Optional[threading.Event]) -> None:
