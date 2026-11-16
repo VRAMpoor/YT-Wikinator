@@ -10,9 +10,13 @@ $icon = Join-Path $root 'ytc.ico'
 # first one on PATH that really runs and has Tk. A candidate is judged by
 # starting it, not by its folder: a Microsoft Store Python lives under
 # WindowsApps and works, while an alias stub that starts nothing fails here.
-function Test-Pythonw([string]$exe) {
+# With -NotNewerThan314 the candidate must also be Python 3.14 or older:
+# faster-whisper cannot be installed on 3.15 yet (NEWEST_TESTED_PYTHON in
+# ytc_setup.py), so a newer Python is taken only when nothing older works.
+function Test-Pythonw([string]$exe, [switch]$NotNewerThan314) {
+    $code = if ($NotNewerThan314) { 'import sys, tkinter; sys.exit(sys.version_info[:2] > (3, 14))' } else { 'import tkinter' }
     try {
-        $p = Start-Process -FilePath $exe -ArgumentList '-c "import tkinter"' -Wait -PassThru -WindowStyle Hidden
+        $p = Start-Process -FilePath $exe -ArgumentList "-c `"$code`"" -Wait -PassThru -WindowStyle Hidden
         return ($p.ExitCode -eq 0)
     } catch {
         return $false
@@ -24,10 +28,15 @@ if (-not (Test-Path -LiteralPath $pythonw)) {
     $pythonw = $null
     $found = @(Get-Command pythonw.exe -All -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)
     foreach ($candidate in $found) {
-        if (Test-Pythonw $candidate) { $pythonw = $candidate; break }
+        if (Test-Pythonw $candidate -NotNewerThan314) { $pythonw = $candidate; break }
+    }
+    if (-not $pythonw) {
+        foreach ($candidate in $found) {
+            if (Test-Pythonw $candidate) { $pythonw = $candidate; break }
+        }
     }
 }
-if (-not $pythonw) { throw 'No working pythonw.exe with Tk support was found. Install Python 3.10+ and add it to PATH.' }
+if (-not $pythonw) { throw 'No working pythonw.exe with Tk support was found. Install Python 3.14 (3.10 to 3.14 work) and add it to PATH.' }
 if (-not (Test-Path -LiteralPath $app)) { throw "Not found: $app" }
 
 $desktop = [Environment]::GetFolderPath('Desktop')

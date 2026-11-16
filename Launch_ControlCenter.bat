@@ -10,6 +10,17 @@ if exist "%~dp0python\pythonw.exe" set "PYW=%~dp0python\pythonw.exe"
 :: First pythonw.exe on PATH that really runs and has Tk. A candidate is judged
 :: by starting it, not by its folder: a Microsoft Store Python lives under
 :: WindowsApps and works, while an alias stub that starts nothing fails here.
+:: The first pass takes only Python 3.14 or older: faster-whisper cannot be
+:: installed on 3.15 yet (NEWEST_TESTED_PYTHON in ytc_setup.py). A newer one
+:: is taken only when nothing older works.
+if not defined PYW (
+    for /f "delims=" %%P in ('where pythonw 2^>nul') do (
+        if not defined PYW (
+            "%%P" -c "import sys, tkinter; sys.exit(sys.version_info[:2] > (3, 14))" >nul 2>&1
+            if not errorlevel 1 set "PYW=%%P"
+        )
+    )
+)
 if not defined PYW (
     for /f "delims=" %%P in ('where pythonw 2^>nul') do (
         if not defined PYW (
@@ -21,7 +32,7 @@ if not defined PYW (
 
 if not defined PYW (
     echo [ERROR] No working pythonw.exe with Tk support was found on PATH.
-    echo Install Python 3.10+ from python.org ^(tick "Add python.exe to PATH"^)
+    echo Install Python 3.14 ^(3.10 to 3.14 work^) from python.org ^(tick "Add python.exe to PATH"^)
     echo or place a Python with pythonw.exe in the "python" subfolder.
     pause
     exit /b 1

@@ -80,7 +80,7 @@ except ImportError:
         ctypes.windll.user32.MessageBoxW(
             None,
             "This Python has no Tk support (tkinter).\n"
-            "Install Python 3.10+ from python.org with the 'tcl/tk and IDLE' option.",
+            "Install Python 3.14 (3.10 to 3.14 work) from python.org with the 'tcl/tk and IDLE' option.",
             "YTC Control Center", 0x10)
     sys.exit(1)
 
@@ -2004,20 +2004,60 @@ class SetupDialog:
                                     justify="left", wraplength=780)
         self.summary_lbl.pack(anchor="w", padx=14, pady=(2, 8))
 
-        self.rows = tk.Frame(self.win, bg=app.bg_card, bd=1, relief="solid")
-        self.rows.pack(fill="x", padx=14)
-
-        self.log_text = tk.Text(self.win, bg="#05070a", fg="#7ee787", font=("Consolas", 8), height=8,
+        # The log is packed before the list, so it keeps its few lines and the
+        # list is what gets shorter on a small screen. The list scrolls then.
+        self.log_text = tk.Text(self.win, bg="#05070a", fg="#7ee787", font=("Consolas", 8), height=6,
                                 wrap="word", relief="flat")
-        self.log_text.pack(fill="both", expand=True, padx=14, pady=(10, 8))
+        self.log_text.pack(side="bottom", fill="both", expand=True, padx=14, pady=(10, 8))
+
+        rows_box = tk.Frame(self.win, bg=app.bg_card, bd=1, relief="solid")
+        rows_box.pack(fill="x", padx=14)
+        self.rows_canvas = tk.Canvas(rows_box, bg=app.bg_card, highlightthickness=0, bd=0, height=1)
+        self.rows_scroll = ttk.Scrollbar(rows_box, orient="vertical", command=self.rows_canvas.yview)
+        self.rows_canvas.configure(yscrollcommand=self.rows_scroll.set)
+        self.rows_canvas.pack(side="left", fill="both", expand=True)
+        self.rows = tk.Frame(self.rows_canvas, bg=app.bg_card)
+        self._rows_item = self.rows_canvas.create_window(0, 0, window=self.rows, anchor="nw")
+        self.rows.bind("<Configure>", lambda e: self._rows_changed())
+        self.rows_canvas.bind("<Configure>", self._rows_canvas_resized)
+        self.win.bind("<MouseWheel>", self._rows_wheel)
 
         self.render()
-        self._fit_height()
+
+    def _rows_changed(self):
+        """The list's content changed: let the canvas ask for its full height
+        (the window then grows to it where the screen allows) and update the
+        scroll area."""
+        self.rows_canvas.configure(height=self.rows.winfo_reqheight(),
+                                   scrollregion=(0, 0, 0, self.rows.winfo_reqheight()))
+        self._rows_scrollbar_if_needed()
+
+    def _rows_canvas_resized(self, event):
+        self.rows_canvas.itemconfigure(self._rows_item, width=event.width)
+        self._rows_scrollbar_if_needed()
+
+    def _rows_scrollbar_if_needed(self):
+        needed = self.rows.winfo_reqheight() > self.rows_canvas.winfo_height() > 1
+        if needed and not self.rows_scroll.winfo_ismapped():
+            self.rows_scroll.pack(side="right", fill="y", before=self.rows_canvas)
+        elif not needed and self.rows_scroll.winfo_ismapped():
+            self.rows_scroll.pack_forget()
+            self.rows_canvas.yview_moveto(0)
+
+    def _rows_wheel(self, event):
+        """Scroll the list with the mouse wheel while the pointer is over it."""
+        widget = self.win.winfo_containing(event.x_root, event.y_root)
+        while widget is not None and widget is not self.rows_canvas:
+            widget = widget.master
+        if widget is self.rows_canvas and self.rows_scroll.winfo_ismapped():
+            self.rows_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
 
     def _fit_height(self):
         """Grow the window when the content wants more than its height, up to
-        the screen height, so that the log keeps a few visible lines."""
+        the screen height."""
         try:
+            self.win.update_idletasks()
+            self._rows_changed()
             self.win.update_idletasks()
             want = min(self.win.winfo_reqheight(), self._max_h)
             if want > self._height:
@@ -2088,6 +2128,7 @@ class SetupDialog:
             summary = ("Some parts are missing. They are not in the GitHub repository because they are large or "
                        "belong to other projects. The button below downloads them from their official sources.")
         self.summary_lbl.config(text=summary)
+        self._fit_height()
 
     def _log(self, message):
         self.app.log(f"[Setup] {message}")

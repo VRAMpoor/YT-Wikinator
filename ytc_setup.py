@@ -496,18 +496,26 @@ def too_new_python_hint(missing: List[str]) -> str:
         return ""
     newest = "%d.%d" % NEWEST_TESTED_PYTHON
     return (f" This is Python {version[0]}.{version[1]}: faster-whisper needs onnxruntime, which had no Windows "
-            f"build for it yet (checked 2026-11-16). Install Python {newest} from python.org and start the "
-            f"app with it. Without faster-whisper the app still runs; only videos that must be transcribed "
+            f"build for it yet (checked 2026-11-16). Install Python {newest} from python.org (tick \"Add "
+            f"python.exe to PATH\"), then run Create_Desktop_Shortcut.bat again: the launchers prefer a Python up "
+            f"to {newest}. Without faster-whisper the app still runs; only videos that must be transcribed "
             f"locally (no captions, or YouTube refuses the transcript) fail.")
 
 
-def check_python_packages() -> Item:
-    missing = missing_pip_packages()
+def check_python_packages(missing: Optional[List[str]] = None) -> Item:
+    missing = missing_pip_packages() if missing is None else missing
     if not missing:
         return Item("pip", "Python packages", True, "yt-dlp, faster-whisper, youtube-transcript-api, requests")
+    detail = "missing or below the minimum version: " + ", ".join(missing) + "."
     hint = too_new_python_hint(missing)
-    return Item("pip", "Python packages", False,
-                "missing or below the minimum version: " + ", ".join(missing) + "." + hint,
+    if hint and all(r.startswith("faster-whisper") for r in missing):
+        # Only faster-whisper is left, and pip probably cannot get it on this
+        # Python. Not required: opening the window at every start would not
+        # help, and the app runs without it. The install stays on offer for
+        # when onnxruntime ships a build for this Python.
+        return Item("pip", "Python packages", False, detail + hint, required=False,
+                    can_install=True, download_bytes=250 * 1000 * 1000, help_url=PYTHON_DOWNLOAD_URL)
+    return Item("pip", "Python packages", False, detail + hint,
                 can_install=True, download_bytes=250 * 1000 * 1000,
                 help_url=PYTHON_DOWNLOAD_URL if hint else "")
 
@@ -688,9 +696,10 @@ def check_browser_transcripts() -> Item:
 
 
 def check_all(cfg: dict) -> List[Item]:
-    return [
+    missing = missing_pip_packages()
+    items = [
         check_gpu(),
-        check_python_packages(),
+        check_python_packages(missing),
         check_llama(cfg),
         check_model(cfg),
         check_ytc(cfg),
@@ -699,6 +708,19 @@ def check_all(cfg: dict) -> List[Item]:
         check_gpu_whisper(),
         check_browser_transcripts(),
     ]
+    if too_new_python_hint(missing):
+        # faster-whisper cannot be installed on this Python, so the Whisper
+        # model and the NVIDIA libraries (about 1.2 GB, used only by Whisper)
+        # would be downloaded for nothing.
+        # The rows' own text ("Whisper still works on the CPU", "faster-whisper
+        # fetches it by itself") is not true here, so it is replaced.
+        for item in items:
+            if item.key in ("whisper", "pip_gpu") and not item.ok:
+                item.can_install = False
+                item.detail = ("not installed: only faster-whisper uses it, and faster-whisper is not "
+                               "installed and probably cannot be on this Python (see 'Python packages'). "
+                               "Without it, videos that must be transcribed locally fail.")
+    return items
 
 
 def needs_attention(items: List[Item]) -> bool:
@@ -1055,7 +1077,8 @@ def install_whisper(log: LogFn, progress: Optional[ProgressFn], cancel: Optional
     snippet = f"from faster_whisper import WhisperModel; WhisperModel('{WHISPER_MODEL}', device='cpu', compute_type='int8')"
     code = _stream([str(python_exe()), "-c", snippet], log, cancel)
     if code != 0:
-        raise SetupError("The Whisper model could not be downloaded. faster-whisper will try again on first use.")
+        raise SetupError("The Whisper model could not be downloaded (see the lines above). Once faster-whisper "
+                         "is installed, it fetches the model by itself on first use.")
 
 
 def _download_ytc(dest: Path, log: LogFn, progress: Optional[ProgressFn],
