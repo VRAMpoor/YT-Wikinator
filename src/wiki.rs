@@ -99,16 +99,22 @@ fn is_foreign_file(path: &Path, kind: PageKind) -> bool {
 /// folder. Windows device names (`NUL`, `COM1`, ..) are refused as well,
 /// because `NUL.md` still names the device there.
 fn is_safe_page_id(video_id: &str) -> bool {
-    const DEVICE_NAMES: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
-    let upper = video_id.to_ascii_uppercase();
-    let is_device = DEVICE_NAMES.contains(&upper.as_str())
-        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
-            && upper.len() == 4
-            && upper.ends_with(|c: char| c.is_ascii_digit()));
     !video_id.is_empty()
         && video_id.len() <= 64
         && video_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        && !is_device
+        && !is_windows_device_name(video_id)
+}
+
+/// True when `name` is a Windows device name (`CON`, `NUL`, `COM1`, ..): a
+/// file of that name, with or without `.md`, opens the device there.
+fn is_windows_device_name(name: &str) -> bool {
+    const DEVICE_NAMES: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    let upper = name.to_ascii_uppercase();
+    let last = upper.chars().last();
+    DEVICE_NAMES.contains(&upper.as_str())
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.chars().count() == 4
+            && last.is_some_and(|c| c.is_ascii_digit() || matches!(c, '¹' | '²' | '³')))
 }
 
 /// Lower-cased so that on a case-insensitive file system a page whose name on
@@ -813,15 +819,43 @@ impl WikiGenerator {
     }
 }
 
+/// Longest slug, in characters: far below the 255-character limit of a file
+/// name, with room for the suffixes added when two slugs collide.
+const MAX_SLUG_CHARS: usize = 100;
+
 fn sanitize_slug(name: &str) -> String {
-    let mut s = name.to_lowercase();
-    s = s.replace('&', "and");
-    s = s.replace(|c: char| !c.is_alphanumeric() && c != '-', "-");
+    let lower = name.to_lowercase();
+    let mut s = String::with_capacity(lower.len());
+    let mut prev: Option<char> = None;
+    let mut chars = lower.chars().peekable();
+    while let Some(c) = chars.next() {
+        let after_word = prev.is_some_and(char::is_alphanumeric);
+        match c {
+            '&' => s.push_str("and"),
+            // Symbols that carry the meaning of a name are spelled out, so
+            // "C++", "C#" and "C" (or ".NET" and "NET") get pages of their own.
+            '+' if after_word || prev == Some('+') => s.push_str("-plus-"),
+            '#' if after_word => s.push_str("-sharp-"),
+            '.' if prev.map_or(true, char::is_whitespace) && chars.peek().is_some_and(|n| n.is_alphanumeric()) => {
+                s.push_str("dot-")
+            }
+            c if c.is_alphanumeric() || c == '-' => s.push(c),
+            _ => s.push('-'),
+        }
+        prev = Some(c);
+    }
     let mut parts: Vec<&str> = s.split('-').filter(|p| !p.is_empty()).collect();
     if parts.is_empty() {
         parts.push("unnamed");
     }
-    parts.join("-")
+    let joined = parts.join("-");
+    let mut slug: String = joined.chars().take(MAX_SLUG_CHARS).collect();
+    slug.truncate(slug.trim_end_matches('-').len());
+    // "aux.md" or "con.md" would open a device on Windows, not a file.
+    if is_windows_device_name(&slug) {
+        slug.push_str("-page");
+    }
+    slug
 }
 
 fn table_cell(text: &str) -> String {
@@ -1486,6 +1520,38 @@ mod tests {
         assert!(is_safe_page_id(&"a".repeat(64)));
         // Four letters starting with COM are only a device with a digit.
         assert!(is_safe_page_id("COMA"));
+    }
+
+    #[test]
+    fn a_slug_never_names_a_windows_device_and_stays_short() {
+        for (name, slug) in [("AUX", "aux-page"), ("Con", "con-page"), ("nul", "nul-page"), ("COM1", "com1-page"), ("LPT9", "lpt9-page")] {
+            assert_eq!(sanitize_slug(name), slug, "{}", name);
+        }
+        assert_eq!(sanitize_slug("Aux Cable"), "aux-cable");
+        assert_eq!(sanitize_slug("Comet"), "comet");
+        assert_eq!(sanitize_slug("..."), "unnamed");
+
+        let long = sanitize_slug(&"word ".repeat(100));
+        assert!(long.chars().count() <= MAX_SLUG_CHARS, "{}", long);
+        assert!(!long.ends_with('-'), "{}", long);
+        assert!(long.starts_with("word-word"), "{}", long);
+    }
+
+    #[test]
+    fn names_told_apart_only_by_a_symbol_get_their_own_slug() {
+        assert_eq!(sanitize_slug("C++"), "c-plus-plus");
+        assert_eq!(sanitize_slug("C#"), "c-sharp");
+        assert_eq!(sanitize_slug("F#"), "f-sharp");
+        assert_eq!(sanitize_slug("C"), "c");
+        assert_eq!(sanitize_slug(".NET"), "dot-net");
+        assert_eq!(sanitize_slug("NET"), "net");
+        // Names without such symbols keep the slug they always had.
+        assert_eq!(sanitize_slug("Chain-of-Thought"), sanitize_slug("Chain of Thought"));
+        assert_eq!(sanitize_slug("Art & Craft"), "art-and-craft");
+        assert_eq!(sanitize_slug("Node.js"), "node-js");
+        assert_eq!(sanitize_slug("Wait... what?"), "wait-what");
+        assert_eq!(sanitize_slug("#shorts"), "shorts");
+        assert_eq!(sanitize_slug("A + B"), "a-b");
     }
 
     #[test]

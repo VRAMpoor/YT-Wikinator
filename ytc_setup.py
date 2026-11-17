@@ -30,6 +30,7 @@ import hashlib
 import http.client
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -60,17 +61,49 @@ MIN_BASE_MODEL_BYTES = 500 * 1024 * 1024
 # llama.cpp rejects it. The tag is pinned to the build this app was tested with.
 LLAMA_TAG = "prism-b12128-d7b2896"
 LLAMA_BASE_URL = f"https://github.com/PrismML-Eng/llama.cpp/releases/download/{LLAMA_TAG}/"
-# CUDA 12.4 build: its runtime zip contains cublas64_12.dll, which the Whisper
-# transcriber (ctranslate2) needs as well, so one download serves both.
-# (file name, size in bytes, sha256). The release is not marked immutable on
-# GitHub, so the size alone proves nothing: every download is checked against
-# the hash before it is unpacked or run. The hashes are the 'digest' fields of
-# the release assets (GitHub API, releases/tags/<LLAMA_TAG>).
-LLAMA_ZIP = (f"llama-{LLAMA_TAG}-bin-win-cuda-12.4-x64.zip", 355_011_546,
-             "14969ae6831abfc836295e8f4b8e09e686a063b559a8c974412001d9f5ce4f7f")
-CUDART_ZIP = ("cudart-llama-bin-win-cuda-12.4-x64.zip", 391_443_627,
-              "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6")
+# Two builds of that release, one pair of zips each: (file name, size in bytes,
+# sha256). The release is not marked immutable on GitHub, so the size alone
+# proves nothing: every download is checked against the hash before it is
+# unpacked or run. The hashes are the 'digest' fields of the release assets
+# (GitHub API, releases/tags/<LLAMA_TAG>).
+# CUDA 12.4 build: for cards before RTX 50. Its runtime zip contains
+# cublas64_12.dll, which the Whisper transcriber (ctranslate2) needs as well,
+# so one download serves both.
+LLAMA_ZIP_12_4 = (f"llama-{LLAMA_TAG}-bin-win-cuda-12.4-x64.zip", 355_011_546,
+                  "14969ae6831abfc836295e8f4b8e09e686a063b559a8c974412001d9f5ce4f7f")
+CUDART_ZIP_12_4 = ("cudart-llama-bin-win-cuda-12.4-x64.zip", 391_443_627,
+                   "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6")
 MIN_DRIVER_FOR_CUDA_12_4 = 551.61
+# CUDA 13.3 build: for RTX 50 cards (compute capability 12.0 and up), where the
+# 12.4 build crashed ("GPU is lost", 3 of 7 runs on an RTX 5090 Laptop) and
+# this one passed 8 of 8. It needs a driver whose CUDA version is 13.3 or newer.
+LLAMA_ZIP_13_3 = (f"llama-{LLAMA_TAG}-bin-win-cuda-13.3-x64.zip", 198_836_745,
+                  "86c6546685ffe2f0954bac062d0bdb347694a2b5eee6f5ddeb1bbfe82d2be1b6")
+CUDART_ZIP_13_3 = ("cudart-llama-bin-win-cuda-13.3-x64.zip", 390_970_417,
+                   "1462a050eb4c684921ba51dcc4cc488a036674c3e73e9945ee705b854808d03e")
+MIN_DRIVER_CUDA_FOR_13_3 = (13, 3)
+# Cards from this compute capability on (RTX 50, Blackwell) get the 13.3 build.
+RTX50_COMPUTE_CAP = (12, 0)
+
+
+@dataclass(frozen=True)
+class EngineBuild:
+    """One build of the engine: the llama.cpp zip and its CUDA runtime zip."""
+    name: str          # written to ENGINE_BUILD_MARKER, e.g. "cuda-13.3"
+    label: str         # for the user, e.g. "CUDA 13.3"
+    llama_zip: tuple
+    cudart_zip: tuple
+
+    @property
+    def download_bytes(self) -> int:
+        return self.llama_zip[1] + self.cudart_zip[1]
+
+
+BUILD_CUDA_12_4 = EngineBuild("cuda-12.4", "CUDA 12.4", LLAMA_ZIP_12_4, CUDART_ZIP_12_4)
+BUILD_CUDA_13_3 = EngineBuild("cuda-13.3", "CUDA 13.3", LLAMA_ZIP_13_3, CUDART_ZIP_13_3)
+ENGINE_BUILDS = {b.name: b for b in (BUILD_CUDA_12_4, BUILD_CUDA_13_3)}
+# Written into bin/llama by the install: which build is in the folder.
+ENGINE_BUILD_MARKER = ".ytc_engine_build"
 
 MODEL_NAME = "Ternary-Bonsai-2-27B-PTQ1_0.gguf"
 # Pinned to one commit of the Hugging Face repository instead of 'main': if the
@@ -90,14 +123,14 @@ RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
 # ready-made program is published for this version: nothing is downloaded,
 # because an unverified exe must never be fetched and run, and ytc.exe is
 # built from source instead.
-YTC_RELEASE_TAG = "v0.1.2"
+YTC_RELEASE_TAG = "v0.1.3"
 # What 'ytc.exe --version' must print for this app: the launcher and ytc.exe
 # belong to one release and work as a pair.
 YTC_VERSION = YTC_RELEASE_TAG.lstrip("v")
 YTC_EXE_NAME = "ytc.exe"
 YTC_EXE_URL = f"https://github.com/{GITHUB_REPO}/releases/download/{YTC_RELEASE_TAG}/{YTC_EXE_NAME}"
-YTC_EXE_SIZE = 12410368
-YTC_EXE_SHA256 = "07550b95089f1d64df9bfe5dad7c2126d5b332b0e5c725f39922ab2cf8048090"
+YTC_EXE_SIZE = 12431360
+YTC_EXE_SHA256 = "bcae988112abec8e226d4323ed64266210ec439e9e60ca608f8cd7e3a69b9839"
 
 # (import name, pip requirement). A '>=' in the requirement is a real minimum:
 # the check compares the installed version with it (see missing_pip_packages).
@@ -127,6 +160,12 @@ WHISPER_CACHE = Path.home() / ".cache" / "huggingface" / "hub" / "models--Systra
 # after the finished engine has answered '--version'. While it exists, the
 # folder is the leftover of an interrupted install.
 LLAMA_INCOMPLETE_MARKER = ".ytc_setup_incomplete"
+# Lines in that marker. A marker without the "build:" line was written by
+# version 0.1.2 or older.
+INCOMPLETE_BUILD_PREFIX = "build: "
+INCOMPLETE_ALL_PLACED = "all files placed; the start test (--version) has not passed yet"
+# How long 'llama-server.exe --version' may take (install and setup check).
+ENGINE_VERSION_TIMEOUT_S = 60
 
 NVIDIA_DRIVER_URL = "https://www.nvidia.com/Download/index.aspx"
 RUSTUP_URL = "https://rustup.rs"
@@ -241,11 +280,11 @@ def python_exe() -> Path:
     return _python_exe_cache
 
 
-def _run(cmd, timeout=30) -> Tuple[int, str]:
+def _run(cmd, timeout=30, env: Optional[dict] = None) -> Tuple[int, str]:
     try:
         res = subprocess.run(
             cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout,
-            encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
+            encoding="utf-8", errors="replace", creationflags=NO_WINDOW, env=env,
         )
         return res.returncode, (res.stdout or "") + (res.stderr or "")
     except Exception as e:  # missing program, timeout, ...
@@ -280,19 +319,150 @@ class Item:
     can_install: bool = False      # install_item() knows how to get it
     download_bytes: int = 0
     help_url: str = ""
+    # Only for the LLM engine: the build the install fetches (ENGINE_BUILDS key),
+    # and a build offered only as the user's explicit choice, with a warning
+    # (see choose_alternative_build).
+    engine_build: str = ""
+    alternative_build: str = ""
 
 
-def check_gpu() -> Item:
-    code, out = _run(["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
-                      "--format=csv,noheader,nounits"])
-    line = out.strip().splitlines()[0] if code == 0 and out.strip() else ""
-    parts = [p.strip() for p in line.split(",")]
-    if len(parts) < 3:
+# --- Graphics card and driver (read with nvidia-smi) ----------------------------
+# The query used since 0.1.3; the older one (without compute_cap) is the
+# fallback for an nvidia-smi that does not know that field.
+GPU_QUERY_FIELDS = ("name", "compute_cap", "driver_version", "memory.total")
+GPU_QUERY_FIELDS_OLD = ("name", "memory.total", "driver_version")
+
+
+@dataclass
+class GpuInfo:
+    name: str
+    memory_mib: str                         # digits only, e.g. "24463"; "" when not readable
+    driver: str                             # e.g. "621.24"
+    compute_cap: Optional[Tuple[int, int]]  # e.g. (12, 0); None when not known
+
+
+@dataclass
+class GpuFacts:
+    """What nvidia-smi says. Empty gpus: no NVIDIA card or no answer."""
+    gpus: List[GpuInfo]
+    driver_cuda: Optional[Tuple[int, int]] = None   # the driver's CUDA version, e.g. (13, 5)
+
+    def highest_compute_cap(self) -> Optional[Tuple[int, int]]:
+        """llama-server uses every CUDA card it sees (the app passes no device
+        option), so the rule follows the newest card: one RTX 50 card among
+        several is enough to need the 13.3 build. None when no card's compute
+        capability is known."""
+        known = [g.compute_cap for g in self.gpus if g.compute_cap is not None]
+        return max(known) if known else None
+
+
+def _major_minor(text: str) -> Optional[Tuple[int, int]]:
+    m = re.fullmatch(r"\s*(\d+)\.(\d+)\s*", text or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def parse_gpu_query(text: str, fields=GPU_QUERY_FIELDS) -> List[GpuInfo]:
+    """Lines of 'nvidia-smi --query-gpu=<fields> --format=csv,noheader[,nounits]',
+    one per card. Lines that do not have the expected fields (an error text,
+    garbage) are skipped. Units such as ' MiB' are removed. A driver text that
+    is not a number alone does not drop the card: nvidia-smi marks
+    driver_version as deprecated, and a deprecated field answers with a text
+    such as '[Requested functionality has been deprecated]'; the card and its
+    compute capability are still needed."""
+    gpus = []
+    for line in (text or "").splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < len(fields):
+            continue
+        value = dict(zip(fields, parts))
+        memory = re.match(r"\d+", value.get("memory.total", ""))
+        driver = value.get("driver_version", "")
+        compute_cap = _major_minor(value.get("compute_cap", ""))
+        if not value.get("name") or not (re.match(r"\d+\.\d+", driver) or compute_cap or memory):
+            continue
+        gpus.append(GpuInfo(value["name"], memory.group(0) if memory else "", driver, compute_cap))
+    return gpus
+
+
+def parse_driver_cuda_version(text: str) -> Optional[Tuple[int, int]]:
+    """The driver's CUDA version from 'nvidia-smi -q': the line 'CUDA UMD
+    Version' (newer drivers mark 'CUDA Version' as deprecated), else 'CUDA
+    Version' (older drivers). None when neither line carries a number."""
+    for label in ("CUDA UMD Version", "CUDA Version"):
+        m = re.search(rf"^\s*{label}\s*:\s*(\d+)\.(\d+)", text or "", re.MULTILINE)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def read_gpu_facts() -> GpuFacts:
+    """Ask nvidia-smi. Never raises: a missing nvidia-smi, a timeout or text
+    that cannot be read give empty or partial facts. 'nvidia-smi -q' is only
+    run for an RTX 50 card, the only case where its answer matters."""
+    code, out = _run(["nvidia-smi", f"--query-gpu={','.join(GPU_QUERY_FIELDS)}", "--format=csv,noheader"])
+    gpus = parse_gpu_query(out, GPU_QUERY_FIELDS) if code == 0 else []
+    if not gpus and code not in (0, -1):
+        # nvidia-smi answered with an error, e.g. an older one that does not
+        # know compute_cap. (-1: it is missing or timed out; asking again would not help.)
+        code, out = _run(["nvidia-smi", f"--query-gpu={','.join(GPU_QUERY_FIELDS_OLD)}",
+                          "--format=csv,noheader,nounits"])
+        gpus = parse_gpu_query(out, GPU_QUERY_FIELDS_OLD) if code == 0 else []
+    facts = GpuFacts(gpus)
+    cap = facts.highest_compute_cap()
+    if cap is not None and cap >= RTX50_COMPUTE_CAP:
+        code, out = _run(["nvidia-smi", "-q"])
+        facts.driver_cuda = parse_driver_cuda_version(out) if code == 0 else None
+    return facts
+
+
+def _cuda_text(version: Optional[Tuple[int, int]]) -> str:
+    return f"{version[0]}.{version[1]}" if version else "unknown"
+
+
+RTX50_CUDA_12_4_WARNING = ("The CUDA 12.4 engine is known to crash on RTX 50 cards (\"GPU is lost\"). "
+                           "The CUDA 13.3 engine does not, but it needs an NVIDIA driver with CUDA 13.3 or newer.")
+
+
+@dataclass(frozen=True)
+class EngineChoice:
+    """Which engine build fits this PC (see choose_engine_build)."""
+    build: EngineBuild
+    rtx50: bool = False
+    driver_problem: str = ""     # not empty: the build cannot be installed with this driver
+
+
+def choose_engine_build(compute_cap: Optional[Tuple[int, int]],
+                        driver_cuda: Optional[Tuple[int, int]]) -> EngineChoice:
+    """The rule of 0.1.3:
+    - card before RTX 50, or compute capability not known: CUDA 12.4 (as before);
+    - RTX 50 and driver CUDA >= 13.3: CUDA 13.3;
+    - RTX 50 and an older or unreadable driver CUDA version: CUDA 13.3 is the
+      right build, but the driver must be updated first. The 12.4 build is only
+      an explicit choice of the user, with RTX50_CUDA_12_4_WARNING."""
+    if compute_cap is None or compute_cap < RTX50_COMPUTE_CAP:
+        return EngineChoice(BUILD_CUDA_12_4)
+    if driver_cuda is not None and driver_cuda >= MIN_DRIVER_CUDA_FOR_13_3:
+        return EngineChoice(BUILD_CUDA_13_3, rtx50=True)
+    found = (f"this driver supports CUDA {_cuda_text(driver_cuda)}" if driver_cuda
+             else "the driver's CUDA version could not be read (nvidia-smi -q)")
+    problem = (f"Update the NVIDIA driver (CUDA {_cuda_text(MIN_DRIVER_CUDA_FOR_13_3)} or newer needed; "
+               f"{found}). The CUDA 12.4 engine is known to crash on RTX 50 cards.")
+    return EngineChoice(BUILD_CUDA_13_3, rtx50=True, driver_problem=problem)
+
+
+def engine_choice_for(facts: GpuFacts) -> EngineChoice:
+    return choose_engine_build(facts.highest_compute_cap(), facts.driver_cuda)
+
+
+def check_gpu(facts: Optional[GpuFacts] = None) -> Item:
+    facts = read_gpu_facts() if facts is None else facts
+    if not facts.gpus:
         return Item("gpu", "NVIDIA graphics card", False,
                     "No NVIDIA card or driver found (nvidia-smi did not answer). "
                     "The LLM engine needs an NVIDIA card with 8 GB VRAM or more and a current driver.",
                     required=True, help_url=NVIDIA_DRIVER_URL)
-    name, mem, driver = parts[0], parts[1], parts[2]
+    first = facts.gpus[0]
+    name, mem, driver = first.name, first.memory_mib, first.driver
     notes = []
     ok = True
     try:
@@ -355,8 +525,12 @@ def _unmet_requirements(packages, installed: dict) -> List[str]:
 
 
 def _run_python_probe(code_text: str, args: List[str], timeout: int = 60) -> Optional[str]:
-    """Run a snippet in python_exe(); its stdout, or None when it failed."""
-    code, out = _run([str(python_exe()), "-c", code_text] + list(args), timeout=timeout)
+    """Run a snippet in python_exe(); its stdout, or None when it failed. The
+    child writes UTF-8 (as _run reads it): otherwise Python 3.10-3.14 writes a
+    pipe in the ANSI code page, and a path like C:\\Users\\José comes back
+    mangled, or the print fails for a character outside that code page."""
+    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+    code, out = _run([str(python_exe()), "-c", code_text] + list(args), timeout=timeout, env=env)
     return out if code == 0 else None
 
 
@@ -451,16 +625,16 @@ def check_gpu_whisper() -> Item:
         return Item("pip_gpu", label, False,
                     "missing: " + ", ".join(missing) + ". Without it Whisper still works, on the CPU, only slower.",
                     required=False, can_install=True, download_bytes=1200 * 1000 * 1000)
-    # The packages being installed is not enough: pip may have put them into
-    # the per-user site, where transcribe_cuda.py does not look.
+    # The packages being installed is not enough: check that the DLLs are in
+    # one of the folders transcribe_cuda.py really searches.
     dlls_missing = whisper_gpu_dlls_missing(whisper_dll_folders())
     if dlls_missing:
         return Item("pip_gpu", label, False,
                     "the pip packages are installed, but transcribe_cuda.py does not find "
-                    + " and ".join(dlls_missing) + " in the folders it searches (this Python's "
-                    "Lib\\site-packages\\nvidia\\...\\bin, the project folder, bin\\llama). Whisper runs on "
-                    "the CPU. This happens when pip installed into the per-user folder; install the two "
-                    "packages into the Python that runs the app, or copy the DLLs into bin\\llama.",
+                    + " and ".join(dlls_missing) + " in the folders it searches (this Python's and the "
+                    "per-user site-packages\\nvidia\\...\\bin, the project folder, bin\\llama). Whisper runs on "
+                    "the CPU. Reinstall the two packages into the Python that runs the app, or copy the "
+                    "DLLs into bin\\llama.",
                     required=False)
     return Item("pip_gpu", label, True,
                 "installed, and transcribe_cuda.py finds cublas64_12.dll and cuDNN; "
@@ -520,30 +694,386 @@ def check_python_packages(missing: Optional[List[str]] = None) -> Item:
                 help_url=PYTHON_DOWNLOAD_URL if hint else "")
 
 
-def check_llama(cfg: dict) -> Item:
+# --- Windows Smart App Control ----------------------------------------------------
+SAC_KEY = r"SYSTEM\CurrentControlSet\Control\CI\Policy"
+SAC_VALUE = "VerifiedAndReputablePolicyState"
+SAC_ON_MESSAGE = ("Windows Smart App Control is on. It blocks the LLM engine, which is not code-signed. The engine "
+                  "can only run with Smart App Control off. That is your security decision; Windows may not let "
+                  "you switch it back on without resetting Windows.")
+SAC_EVALUATION_MESSAGE = ("Windows Smart App Control is in evaluation mode. Windows may switch it on later by "
+                          "itself; it then blocks the LLM engine, which is not code-signed.")
+
+
+def smart_app_control_state(reg=None) -> int:
+    """VerifiedAndReputablePolicyState, read-only: 1 = on, 2 = evaluation mode,
+    0 = off. 0 as well when the value is missing or cannot be read, and on
+    other systems than Windows. Never raises. reg: a stand-in for winreg (tests)."""
+    try:
+        if reg is None:
+            if sys.platform != "win32":
+                return 0
+            import winreg as reg
+        with reg.OpenKey(reg.HKEY_LOCAL_MACHINE, SAC_KEY, 0, reg.KEY_READ) as key:
+            value, _kind = reg.QueryValueEx(key, SAC_VALUE)
+        return int(value) if int(value) in (0, 1, 2) else 0
+    except Exception:  # missing key or value, no access, unexpected type
+        return 0
+
+
+def check_smart_app_control(state: int) -> Optional[Item]:
+    """A row for the setup window, or None when Smart App Control is off."""
+    label = "Windows Smart App Control"
+    if state == 1:
+        return Item("sac", label, False, SAC_ON_MESSAGE, required=True)
+    if state == 2:
+        return Item("sac", label, True, "Warning: " + SAC_EVALUATION_MESSAGE, required=False)
+    return None
+
+
+# --- Microsoft Visual C++ runtime --------------------------------------------------
+# llama-server.exe and its DLLs (and ytc.exe) are built against the Visual C++
+# 2015-2022 runtime and do not carry it; a fresh Windows does not have all of it.
+# Without it the engine fails its start test with 0xC0000135 ('a DLL is
+# missing'), and installing the engine again cannot change that.
+VC_RUNTIME_DLLS = ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll", "vcomp140.dll")
+VC_REDIST_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+VC_RUNTIME_MESSAGE = (f"The LLM engine and ytc.exe need the Microsoft Visual C++ 2015-2022 runtime (x64). "
+                      f"Install it with vc_redist.x64.exe from {VC_REDIST_URL}, then run the setup check again.")
+
+
+def _vc_runtime_folders() -> List[Path]:
+    """Where Windows looks for these DLLs when it starts the engine: its own
+    folder, the 64-bit system folder, then the folders on PATH."""
+    windir = Path(os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows")
+    # A 32-bit Python sees SysWOW64 as System32; Sysnative is the real one then.
+    system = windir / "Sysnative" if (windir / "Sysnative").is_dir() else windir / "System32"
+    path = [Path(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p.strip()]
+    return [LLAMA_DIR, system] + path
+
+
+def vc_runtime_missing(folders=None) -> List[str]:
+    """The Visual C++ runtime DLLs (VC_RUNTIME_DLLS) that are in none of the
+    folders (default: _vc_runtime_folders()). Always [] on other systems than
+    Windows. Never raises."""
+    if folders is None:
+        if sys.platform != "win32":
+            return []
+        folders = _vc_runtime_folders()
+    missing = []
+    for name in VC_RUNTIME_DLLS:
+        found = False
+        for folder in folders:
+            try:
+                if (Path(folder) / name).is_file():
+                    found = True
+                    break
+            except (OSError, ValueError):
+                continue
+        if not found:
+            missing.append(name)
+    return missing
+
+
+def check_vc_runtime(missing: List[str]) -> Optional[Item]:
+    """A row for the setup window, or None when the runtime is there."""
+    if not missing:
+        return None
+    return Item("vcredist", "Microsoft Visual C++ runtime (2015-2022, x64)", False,
+                f"{', '.join(missing)} not found. {VC_RUNTIME_MESSAGE}", required=True, help_url=VC_REDIST_URL)
+
+
+# --- Why the engine does not start ------------------------------------------------
+# {who}: the program that stopped ('the engine', 'the web server', ...).
+KNOWN_EXIT_CODES = {
+    0xC0E90002: "Windows (Smart App Control / Code Integrity) blocked {who}",
+    0xC0000135: "a DLL is missing",
+    0xC0000409: "{who} stopped itself after an error",
+}
+STATUS_DLL_NOT_FOUND = 0xC0000135
+# CreateProcess error: 'An Application Control policy has blocked this file.'
+WINERROR_APP_CONTROL_BLOCKED = 4551
+
+
+def describe_exit_code(code: int, who: str = "the engine") -> str:
+    """An exit code for people: decimal and hex, plus what a known Windows code
+    means; `who` names the program that stopped. Negative values (a signed
+    reading of the same 32 bits) are shown as Windows shows them:
+    describe_exit_code(3236495362) == describe_exit_code(-1058471934)
+    == 'exit code 3236495362 (0xC0E90002): Windows (Smart App Control / Code
+    Integrity) blocked the engine'."""
+    unsigned = int(code) & 0xFFFFFFFF
+    text = f"exit code {unsigned} (0x{unsigned:08X})"
+    meaning = KNOWN_EXIT_CODES.get(unsigned)
+    return f"{text}: {meaning.format(who=who)}" if meaning else text
+
+
+def dll_missing_hint(code: int) -> str:
+    """For 0xC0000135 (a DLL is missing): which DLLs are usually missing and
+    where to get them. Empty for every other code."""
+    if int(code) & 0xFFFFFFFF != STATUS_DLL_NOT_FOUND:
+        return ""
+    return (" (usually the Microsoft Visual C++ 2015-2022 runtime: install vc_redist.x64.exe from "
+            f"{VC_REDIST_URL})")
+
+
+def last_log_lines(path: Path, count: int = 15) -> str:
+    """The last `count` lines of a log file, for an error message. When the file
+    is empty or does not exist: '<name> is empty: the engine stopped before it
+    wrote anything'. Never raises."""
+    empty = f"{Path(path).name} is empty: the engine stopped before it wrote anything"
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 64 * 1024))
+            text = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return empty
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    return "\n".join(lines[-count:]) if lines else empty
+
+
+def engine_failure_text(code: int, output: str) -> str:
+    """Why '--version' failed, from its exit code and what it printed."""
+    out = (output or "").strip()
+    return (describe_exit_code(code) + dll_missing_hint(code)
+            + (f". It printed: {out[:300]}" if out else ". It printed nothing."))
+
+
+def engine_timeout_text(timeout: int) -> str:
+    return (f"it did not answer '--version' within {timeout} s. That usually means Windows stopped it with an "
+            f"error window (for example 'Bad Image', when Smart App Control or an antivirus blocks one of its "
+            f"DLLs) that waits for a click, or an antivirus is still scanning the new files. Look for such a "
+            f"window, check Smart App Control (Windows Security > App & browser control), then run the setup "
+            f"check again.")
+
+
+SEM_FAILCRITICALERRORS = 0x0001
+SEM_NOOPENFILEERRORBOX = 0x8000
+
+
+class _NoErrorBoxes:
+    """While active, Windows shows no error window ('Bad Image', 'DLL not
+    found') for this process and the programs it starts (they inherit the
+    error mode), so a broken engine fails at once with its exit code instead of
+    waiting for a click. Process-wide, restored afterwards. Does nothing on
+    other systems, and any failure here is ignored.
+
+    The error mode belongs to the whole process, and several threads may use
+    this at once (the engine and the web server start in parallel, each with a
+    '--version' check). So the first one in sets the mode, the last one out
+    restores it, and a thread leaving early never undoes it for the others."""
+
+    _lock = threading.Lock()
+    _users = 0
+    _kernel32 = None
+    _previous = None
+
+    def __enter__(self):
+        if sys.platform != "win32":
+            return self
+        cls = type(self)
+        with cls._lock:
+            if cls._users == 0:
+                try:
+                    import ctypes
+                    kernel32 = ctypes.WinDLL("kernel32")
+                    kernel32.SetErrorMode.argtypes = [ctypes.c_uint]
+                    kernel32.SetErrorMode.restype = ctypes.c_uint
+                    wanted = SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX
+                    previous = kernel32.SetErrorMode(wanted)
+                    kernel32.SetErrorMode(previous | wanted)     # keep flags that were set before
+                    cls._kernel32, cls._previous = kernel32, previous
+                except Exception:
+                    cls._kernel32, cls._previous = None, None
+            cls._users += 1
+        return self
+
+    def __exit__(self, *exc):
+        if sys.platform != "win32":
+            return False
+        cls = type(self)
+        with cls._lock:
+            cls._users = max(0, cls._users - 1)
+            if cls._users == 0 and cls._kernel32 is not None:
+                try:
+                    cls._kernel32.SetErrorMode(cls._previous)
+                except Exception:
+                    pass
+                cls._kernel32, cls._previous = None, None
+        return False
+
+
+def run_engine_version(exe: Path, timeout: int = ENGINE_VERSION_TIMEOUT_S) -> Tuple[bool, str]:
+    """Run 'llama-server.exe --version' hidden, without error windows. It loads
+    no model. Returns (True, "") or (False, the reason for the user)."""
+    try:
+        with _NoErrorBoxes():
+            res = subprocess.run([str(exe), "--version"], capture_output=True, stdin=subprocess.DEVNULL,
+                                 timeout=timeout, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        return False, engine_timeout_text(timeout)
+    except OSError as e:
+        if getattr(e, "winerror", None) == WINERROR_APP_CONTROL_BLOCKED:
+            return False, f"Windows (Smart App Control / Code Integrity) blocked the engine: {e}"
+        return False, f"Windows could not start it: {e}"
+    if res.returncode == 0:
+        return True, ""
+    return False, engine_failure_text(res.returncode, (res.stdout or "") + (res.stderr or ""))
+
+
+# --- The LLM engine ------------------------------------------------------------------
+def installed_engine_build(folder: Path) -> Optional[str]:
+    """Which build is in the engine folder: the marker written by the install
+    ('cuda-12.4', 'cuda-13.3') wins. Without it, the CUDA runtime DLLs tell the
+    CUDA generation: cublas64_13.dll -> 'cuda-13.x', cublas64_12.dll ->
+    'cuda-12.4'. Both together (a switch from 12.4 to 13.3 leaves the _12 DLLs
+    behind on purpose, for Whisper) count as 13. None when nothing tells."""
+    try:
+        text = (folder / ENGINE_BUILD_MARKER).read_text(encoding="utf-8", errors="replace").strip()
+        first = text.splitlines()[0].strip() if text else ""
+        if re.fullmatch(r"cuda-\d+\.(\d+|x)", first):
+            return first
+    except OSError:
+        pass
+    try:
+        if any(folder.glob("cublas64_13*.dll")):
+            return "cuda-13.x"
+        if any(folder.glob("cublas64_12*.dll")):
+            return BUILD_CUDA_12_4.name
+    except OSError:
+        pass
+    return None
+
+
+def is_cuda_12_build(name: Optional[str]) -> bool:
+    return bool(name) and name.startswith("cuda-12.")
+
+
+def _engine_files_placed(folder: Path) -> bool:
+    """For a folder with the incomplete marker: were all files placed, so that
+    only the start test is missing? Markers of this version say so in a line.
+    An older marker (no 'build:' line) has no such line, so the files that
+    llama-server.exe cannot start without are looked at instead."""
+    try:
+        text = (folder / LLAMA_INCOMPLETE_MARKER).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if INCOMPLETE_BUILD_PREFIX in text:
+        return INCOMPLETE_ALL_PLACED in text
+    # 0.1.2 moved the llama zip files first and the CUDA runtime DLLs of the
+    # cudart zip last: those are looked for too.
+    try:
+        return (all((folder / name).exists() for name in ("llama-server.exe", "llama.dll", "ggml-cuda.dll"))
+                and all(any(folder.glob(pattern))
+                        for pattern in ("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")))
+    except OSError:
+        return False
+
+
+def choose_alternative_build(item: Item) -> None:
+    """The user chose the item's alternative build (the CUDA 12.4 engine on an
+    RTX 50 card whose driver is too old for 13.3) after seeing
+    RTX50_CUDA_12_4_WARNING: the install button then fetches that build."""
+    build = ENGINE_BUILDS.get(item.alternative_build)
+    if build is None:
+        return
+    item.engine_build = build.name
+    item.alternative_build = ""
+    item.can_install = True
+    item.download_bytes = build.download_bytes
+
+
+def check_llama(cfg: dict, gpu: Optional[GpuFacts] = None, sac: Optional[int] = None,
+                vc_missing: Optional[List[str]] = None) -> Item:
+    """gpu, sac, vc_missing: what check_all has read already (read here when None)."""
+    label = "LLM engine (llama.cpp, PrismML build) + CUDA runtime"
+    facts = read_gpu_facts() if gpu is None else gpu
+    choice = engine_choice_for(facts)
+    sac = smart_app_control_state() if sac is None else sac
+    vc_missing = vc_runtime_missing() if vc_missing is None else vc_missing
+    want = choice.build
+
+    def offer(detail: str) -> Item:
+        """Not OK; the install of the right build is offered when it can run."""
+        if sac == 1:
+            return Item("llama", label, False, f"{detail} The download waits until Smart App Control is off "
+                        f"(see 'Windows Smart App Control').", can_install=False)
+        if vc_missing:
+            # The engine cannot start without it: installing it again would fail the same way.
+            return Item("llama", label, False, f"{detail} The download waits until the Microsoft Visual C++ "
+                        f"runtime is installed (see 'Microsoft Visual C++ runtime').", can_install=False,
+                        help_url=VC_REDIST_URL)
+        if choice.driver_problem:
+            return Item("llama", label, False, f"{detail} {choice.driver_problem}", can_install=False,
+                        help_url=NVIDIA_DRIVER_URL, alternative_build=BUILD_CUDA_12_4.name)
+        return Item("llama", label, False, detail, can_install=True, download_bytes=want.download_bytes,
+                    engine_build=want.name)
+
     path, _ = find_llama_server(cfg)
-    size = LLAMA_ZIP[1] + CUDART_ZIP[1]
     if path is None:
-        return Item("llama", "LLM engine (llama.cpp, PrismML build) + CUDA runtime", False,
-                    f"llama-server.exe not found. Will be placed in {LLAMA_DIR}",
-                    can_install=True, download_bytes=size)
-    if (path.parent / LLAMA_INCOMPLETE_MARKER).exists():
-        return Item("llama", "LLM engine (llama.cpp, PrismML build) + CUDA runtime", False,
-                    f"{path.parent} is incomplete: an install into it was interrupted. "
-                    "The install will be repeated.", can_install=True, download_bytes=size)
-    if not (path.parent / "ggml-cuda.dll").exists():
-        return Item("llama", "LLM engine (llama.cpp, PrismML build) + CUDA runtime", False,
-                    f"{path} has no CUDA backend (ggml-cuda.dll); it would run on the CPU only",
-                    can_install=True, download_bytes=size)
+        return offer(f"llama-server.exe not found. Will be placed in {LLAMA_DIR}.")
+    folder = path.parent
+    incomplete = folder / LLAMA_INCOMPLETE_MARKER
+    if incomplete.exists():
+        if not _engine_files_placed(folder):
+            return offer(f"{folder} is incomplete: an install into it was interrupted. "
+                         "The install will be repeated.")
+        # Everything was placed; only the start test failed (for example
+        # Windows blocked a DLL). The cause may be gone: test again, once.
+        started, reason = run_engine_version(path)
+        if not started:
+            return offer(f"The engine in {folder} was installed but does not start: {reason.rstrip('.')}. "
+                         "The install can be repeated.")
+        try:
+            incomplete.unlink()
+        except OSError:
+            pass
+    if not (folder / "ggml-cuda.dll").exists():
+        return offer(f"{path} has no CUDA backend (ggml-cuda.dll); it would run on the CPU only.")
     # Files copied into bin/llama by hand carry no marker: llama-server.exe
     # cannot start without llama.dll, so a missing llama.dll means half a copy.
-    if path.parent == LLAMA_DIR.resolve() and not (path.parent / "llama.dll").exists():
-        return Item("llama", "LLM engine (llama.cpp, PrismML build) + CUDA runtime", False,
-                    f"{path.parent} is incomplete (llama.dll is missing). The install will be repeated.",
-                    can_install=True, download_bytes=size)
-    has_runtime = any(path.parent.glob("cublas64_*.dll"))
+    if folder == LLAMA_DIR.resolve() and not (folder / "llama.dll").exists():
+        return offer(f"{folder} is incomplete (llama.dll is missing). The install will be repeated.")
+    has_runtime = any(folder.glob("cublas64_*.dll"))
     detail = str(path) if has_runtime else f"{path} (CUDA runtime DLLs come from elsewhere on this PC)"
-    return Item("llama", "LLM engine (llama.cpp, PrismML build) + CUDA runtime", True, detail)
+    if not choice.rtx50:
+        return Item("llama", label, True, detail)
+
+    # An RTX 50 card: the CUDA 12.4 build can crash there.
+    installed = installed_engine_build(folder)
+    if is_cuda_12_build(installed):
+        if folder != LLAMA_DIR.resolve():
+            # The engine named by llm.server_binary in config.json. The install
+            # only writes bin/llama and the app would keep using this one, so
+            # offering it would never end: a warning that says what to do.
+            return Item("llama", label, False,
+                        f"{path} (llm.server_binary in config.json) is the CUDA 12.4 build. On RTX 50 cards it "
+                        f"can crash (\"GPU is lost\"). Replace it with the {want.label} build, or remove "
+                        f"llm.server_binary from config.json so that the setup check offers the {want.label} "
+                        f"build for {LLAMA_DIR}." + (f" {choice.driver_problem}" if choice.driver_problem else ""),
+                        required=False, help_url=NVIDIA_DRIVER_URL if choice.driver_problem else "")
+        if choice.driver_problem:
+            # Nothing to install until the driver is updated, and the 12.4
+            # engine still runs most of the time: a warning, not a blocker
+            # (also when the user chose 12.4 on purpose).
+            return Item("llama", label, False,
+                        f"{path}: the CUDA 12.4 build is installed. On RTX 50 cards it can crash (\"GPU is lost\"). "
+                        f"{choice.driver_problem} After the update, the setup check offers the "
+                        f"{want.label} build.", required=False, help_url=NVIDIA_DRIVER_URL)
+        return offer(f"The CUDA 12.4 build is installed. On RTX 50 cards it can crash (\"GPU is lost\"). "
+                     f"Recommended: switch to the {want.label} build ({human_size(want.download_bytes)} download).")
+    if installed is None:
+        return Item("llama", label, True, f"{detail} (build not known; on RTX 50 cards use the "
+                                          f"{want.label} build)")
+    if choice.driver_problem:
+        if facts.driver_cuda is None:
+            # Not read (nvidia-smi -q failed or timed out) is not "too old": the
+            # installed 13.x engine stays as it is; no 12.4 build is suggested.
+            return Item("llama", label, True, f"{detail} (the driver's CUDA version could not be read "
+                                              f"with nvidia-smi -q; it needs CUDA 13.3 or newer)")
+        return offer(f"{path}: the {installed.replace('cuda-', 'CUDA ')} build is installed.")
+    return Item("llama", label, True, detail)
 
 
 def check_model(cfg: dict) -> Item:
@@ -570,9 +1100,10 @@ def ytc_version(path: Path) -> Tuple[Optional[str], str]:
     """The version 'ytc.exe --version' prints (run hidden; the answer is
     'ytc <version>'), or (None, reason) when the program could not be asked.
     A call that failed says nothing about the version."""
-    code, out = _run([str(path), "--version"], timeout=20)
+    with _NoErrorBoxes():   # a missing DLL fails at once instead of waiting behind an error window
+        code, out = _run([str(path), "--version"], timeout=20)
     if code != 0:
-        return None, out.strip()[:300] or f"exit code {code}"
+        return None, out.strip()[:300] or describe_exit_code(code, "ytc.exe") + dll_missing_hint(code)
     words = out.split()
     if not words:
         return None, "no answer to '--version'"
@@ -697,10 +1228,17 @@ def check_browser_transcripts() -> Item:
 
 def check_all(cfg: dict) -> List[Item]:
     missing = missing_pip_packages()
+    gpu = read_gpu_facts()
+    sac = smart_app_control_state()
+    sac_item = check_smart_app_control(sac)
+    vc_missing = vc_runtime_missing()
+    vc_item = check_vc_runtime(vc_missing)
     items = [
-        check_gpu(),
+        check_gpu(gpu),
+        *([sac_item] if sac_item else []),
+        *([vc_item] if vc_item else []),
         check_python_packages(missing),
-        check_llama(cfg),
+        check_llama(cfg, gpu, sac, vc_missing),
         check_model(cfg),
         check_ytc(cfg),
         check_database(cfg),
@@ -950,25 +1488,86 @@ def _extract_zip(zip_path: Path, target: Path, cancel: Optional[threading.Event]
                     sink.write(chunk)
 
 
-def _place_engine_files(files, target_dir: Path, cancel: Optional[threading.Event] = None) -> Path:
+def _file_in_use(path: Path) -> bool:
+    """True when an existing file cannot be opened for writing. On Windows that
+    is an .exe or .dll a running program has loaded (llama-server.exe started
+    from this folder): such a file cannot be replaced. Opening it changes nothing."""
+    try:
+        if not path.is_file():
+            return False
+        with open(path, "r+b"):
+            return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def engine_in_use_text(folder: Path, name: str) -> str:
+    return (f"{name} in {folder} is in use: the LLM engine (or another program using its files) is running, "
+            f"so the engine cannot be replaced. Press 'Stop Engine' in the Control Center (and stop any "
+            f"running crawl), then install again. Nothing in {folder} was changed.")
+
+
+def _place_engine_files(files, target_dir: Path, cancel: Optional[threading.Event] = None,
+                        build: str = "") -> Path:
     """Move unpacked files into the engine folder. Returns the marker file,
     which is written before the first move: from then until the caller deletes
     it, the folder counts as incomplete, whatever stops the install (cancel,
-    full disk, closed window, power loss)."""
+    full disk, closed window, power loss). When every file is in place, the
+    marker says so, and the build name is written to ENGINE_BUILD_MARKER (the
+    old one is removed before the first move, so it never names a half-replaced
+    folder). A file to be replaced that is in use (the engine is running) stops
+    it before anything is changed."""
     target_dir.mkdir(parents=True, exist_ok=True)
+    files = list(files)
+    for f in files:
+        if _file_in_use(target_dir / Path(f).name):
+            raise SetupError(engine_in_use_text(target_dir, Path(f).name))
     marker = target_dir / LLAMA_INCOMPLETE_MARKER
     marker.write_text("An install of the LLM engine into this folder did not finish.\n"
-                      "Run the setup check again; it repeats the install.\n", encoding="utf-8")
+                      "Run the setup check again; it repeats the install.\n"
+                      f"{INCOMPLETE_BUILD_PREFIX}{build or 'unknown'}\n", encoding="utf-8")
+    (target_dir / ENGINE_BUILD_MARKER).unlink(missing_ok=True)
     for f in files:
         _check_cancel(cancel)
         os.replace(f, target_dir / Path(f).name)
+    if build:
+        (target_dir / ENGINE_BUILD_MARKER).write_text(build + "\n", encoding="utf-8")
+    with open(marker, "a", encoding="utf-8") as f:
+        f.write(INCOMPLETE_ALL_PLACED + "\n")
     return marker
 
 
-def install_llama(log: LogFn, progress: Optional[ProgressFn], cancel: Optional[threading.Event]) -> None:
+def install_llama(log: LogFn, progress: Optional[ProgressFn], cancel: Optional[threading.Event],
+                  build: str = "") -> None:
+    """Install the engine build `build` (an ENGINE_BUILDS key; the user's
+    explicit choice), or, when empty, the build that choose_engine_build picks
+    for this PC's card and driver."""
+    if smart_app_control_state() == 1:
+        # The engine could not run: do not download 600-750 MB for nothing.
+        raise SetupError(SAC_ON_MESSAGE)
+    vc_missing = vc_runtime_missing()
+    if vc_missing:
+        # Same: the start test would fail with 'a DLL is missing' after the download.
+        raise SetupError(f"{', '.join(vc_missing)} not found. {VC_RUNTIME_MESSAGE}")
+    if build:
+        chosen = ENGINE_BUILDS.get(build)
+        if chosen is None:
+            raise SetupError(f"Unknown engine build '{build}'.")
+    else:
+        choice = engine_choice_for(read_gpu_facts())
+        if choice.driver_problem:
+            raise SetupError(choice.driver_problem)
+        chosen = choice.build
+    if _file_in_use(LLAMA_DIR / "llama-server.exe"):
+        # The engine is running from bin/llama: do not download 600-750 MB that
+        # could not be put in place (_place_engine_files checks every file again).
+        raise SetupError(engine_in_use_text(LLAMA_DIR, "llama-server.exe"))
+    log(f"Engine build: {chosen.label}.")
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     zips = []
-    for name, size, sha256 in (LLAMA_ZIP, CUDART_ZIP):
+    for name, size, sha256 in (chosen.llama_zip, chosen.cudart_zip):
         log(f"Downloading {name} ({human_size(size)}) from github.com/PrismML-Eng/llama.cpp ...")
         zips.append(download_file(LLAMA_BASE_URL + name, DOWNLOAD_DIR / name, size, log, progress, cancel, sha256))
 
@@ -992,18 +1591,18 @@ def install_llama(log: LogFn, progress: Optional[ProgressFn], cancel: Optional[t
             raise SetupError(f"{zips[0].name} does not contain llama-server.exe")
         files = [f for f in servers[0].parent.iterdir() if f.is_file()]
         files += list((work / "cudart").rglob("*.dll"))
-        marker = _place_engine_files(files, LLAMA_DIR, cancel)
+        marker = _place_engine_files(files, LLAMA_DIR, cancel, chosen.name)
 
-        code, out = _run([str(LLAMA_DIR / "llama-server.exe"), "--version"], timeout=60)
-        if code != 0:
-            raise SetupError(f"The downloaded llama-server.exe does not start: {out.strip()[:300]}")
+        started, reason = run_engine_version(LLAMA_DIR / "llama-server.exe")
+        if not started:
+            raise SetupError(f"The downloaded llama-server.exe does not start: {reason}")
         marker.unlink()
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
     for z in zips:
         z.unlink(missing_ok=True)
-    log(f"LLM engine installed in {LLAMA_DIR}")
+    log(f"LLM engine ({chosen.label} build) installed in {LLAMA_DIR}")
 
 
 def install_model(log: LogFn, progress: Optional[ProgressFn], cancel: Optional[threading.Event]) -> None:
@@ -1012,9 +1611,11 @@ def install_model(log: LogFn, progress: Optional[ProgressFn], cancel: Optional[t
     log(f"Base model saved to {MODELS_DIR / MODEL_NAME}")
 
 
-def _stream(cmd, log: LogFn, cancel: Optional[threading.Event], cwd: Optional[Path] = None) -> int:
-    """Run a command hidden and pass its output lines to log()."""
-    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+def _stream(cmd, log: LogFn, cancel: Optional[threading.Event], cwd: Optional[Path] = None,
+            extra_env: Optional[dict] = None, hide: Optional[Callable[[str], bool]] = None) -> int:
+    """Run a command hidden and pass its output lines to log() (except lines
+    for which hide(line) is true)."""
+    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", **(extra_env or {}))
     try:
         proc = subprocess.Popen(
             cmd, cwd=str(cwd) if cwd else None, stdin=subprocess.DEVNULL,
@@ -1023,11 +1624,30 @@ def _stream(cmd, log: LogFn, cancel: Optional[threading.Event], cwd: Optional[Pa
         )
     except OSError as e:
         raise SetupError(f"Could not start {cmd[0]}: {e}") from e
-    for line in proc.stdout:
+    # The lines are read in a helper thread: pip prints nothing while it
+    # downloads a large wheel into a pipe, and Cancel must work meanwhile.
+    lines: "queue.Queue[Optional[str]]" = queue.Queue()
+
+    def pump() -> None:
+        try:
+            for text in proc.stdout:
+                lines.put(text)
+        except (OSError, ValueError):   # pipe closed after taskkill
+            pass
+        finally:
+            lines.put(None)
+    threading.Thread(target=pump, daemon=True).start()
+    while True:
         if cancel is not None and cancel.is_set():
             subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, creationflags=NO_WINDOW)
             raise SetupCancelled()
-        if line.strip():
+        try:
+            line = lines.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if line is None:
+            break
+        if line.strip() and not (hide is not None and hide(line)):
             log(line.rstrip())
     return proc.wait()
 
@@ -1075,10 +1695,24 @@ def install_pip_browser(log: LogFn, progress: Optional[ProgressFn], cancel: Opti
 def install_whisper(log: LogFn, progress: Optional[ProgressFn], cancel: Optional[threading.Event]) -> None:
     log(f"Downloading the Whisper speech model '{WHISPER_MODEL}' ...")
     snippet = f"from faster_whisper import WhisperModel; WhisperModel('{WHISPER_MODEL}', device='cpu', compute_type='int8')"
-    code = _stream([str(python_exe()), "-c", snippet], log, cancel)
+    code = _stream([str(python_exe()), "-c", snippet], log, cancel,
+                   extra_env={"HF_HUB_DISABLE_SYMLINKS_WARNING": "1"}, hide=is_harmless_hf_warning)
     if code != 0:
         raise SetupError("The Whisper model could not be downloaded (see the lines above). Once faster-whisper "
                          "is installed, it fetches the model by itself on first use.")
+    log(f"Whisper model downloaded ({WHISPER_CACHE}).")
+
+
+def is_harmless_hf_warning(line: str) -> bool:
+    """huggingface_hub's notes while the Whisper model downloads that need no
+    action: the optional 'hf_xet' package is not installed (it falls back to
+    plain HTTP), and Windows gives no symlinks (the cache still works). The
+    symlink note is also switched off with HF_HUB_DISABLE_SYMLINKS_WARNING;
+    these patterns catch it should a version ignore that. Any other line that
+    names hf_xet (an import error, an hf_xet exception) is shown."""
+    if "Xet Storage is enabled for this repo" in line and "package is not installed" in line:
+        return True
+    return any(p in line for p in ("cache-system uses symlinks", "To support symlinks on Windows"))
 
 
 def _download_ytc(dest: Path, log: LogFn, progress: Optional[ProgressFn],
@@ -1174,7 +1808,9 @@ def install_missing(items: List[Item], log: LogFn = print, progress: Optional[Pr
         if item.ok or not item.can_install or item.key not in INSTALLERS:
             continue
         try:
-            INSTALLERS[item.key](log, progress, cancel)
+            # Only the engine item carries a build (the one the check chose, or the user's explicit choice).
+            extra = {"build": item.engine_build} if item.engine_build else {}
+            INSTALLERS[item.key](log, progress, cancel, **extra)
         except SetupCancelled:
             raise
         except SetupError as e:
@@ -1188,10 +1824,17 @@ def install_missing(items: List[Item], log: LogFn = print, progress: Optional[Pr
 
 # --- Command line ---------------------------------------------------------------
 def _load_cfg() -> dict:
+    """config.json, or {} (the defaults) when it is missing or cannot be read.
+    utf-8-sig: Notepad may save the file with a BOM. A broken file is named."""
+    path = ROOT / "config.json"
     try:
-        with open(ROOT / "config.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"{path.name} could not be read ({e}); the default settings are used.")
         return {}
 
 
@@ -1243,21 +1886,52 @@ def self_test() -> int:
     from unittest import mock
 
     this = sys.modules[__name__]
+    # The real functions, for the tests of them; every test runs with stand-ins
+    # (see setUp), so no test depends on this PC's card, driver or registry,
+    # and none can start the engine.
+    real_read_gpu_facts = read_gpu_facts
+    real_smart_app_control_state = smart_app_control_state
+    real_run_engine_version = run_engine_version
+    real_vc_runtime_missing = vc_runtime_missing
+
+    RTX5090 = GpuInfo("NVIDIA GeForce RTX 5090 Laptop GPU", "24463", "621.24", (12, 0))
+    RTX4070 = GpuInfo("NVIDIA GeForce RTX 4070 Laptop GPU", "8188", "566.36", (8, 9))
 
     class Tests(unittest.TestCase):
         def setUp(self):
             self._tmp = tempfile.TemporaryDirectory()
             self.tmp = Path(self._tmp.name)
             self.addCleanup(self._tmp.cleanup)
+            for patch in (mock.patch.object(this, "LLAMA_DIR", self.tmp / "app" / "bin" / "llama"),
+                          mock.patch.object(this, "read_gpu_facts", return_value=GpuFacts([])),
+                          mock.patch.object(this, "smart_app_control_state", return_value=0),
+                          mock.patch.object(this, "vc_runtime_missing", return_value=[]),
+                          mock.patch.object(this, "run_engine_version",
+                                            side_effect=AssertionError("the self-test must not start the engine"))):
+                patch.start()
+                self.addCleanup(patch.stop)
 
         def test_sizes_use_decimal_units(self):
             self.assertEqual(human_size(MODEL_SIZE), "5.95 GB")
-            self.assertEqual(human_size(LLAMA_ZIP[1]), "355 MB")
-            self.assertEqual(human_size(CUDART_ZIP[1]), "391 MB")
+            self.assertEqual(human_size(LLAMA_ZIP_12_4[1]), "355 MB")
+            self.assertEqual(human_size(CUDART_ZIP_12_4[1]), "391 MB")
+            self.assertEqual(human_size(LLAMA_ZIP_13_3[1]), "199 MB")
+            self.assertEqual(human_size(CUDART_ZIP_13_3[1]), "391 MB")
+            self.assertEqual(BUILD_CUDA_12_4.download_bytes, 746_455_173)
+            self.assertEqual(BUILD_CUDA_13_3.download_bytes, 589_807_162)
+            self.assertEqual(human_size(BUILD_CUDA_13_3.download_bytes), "590 MB")
 
         def test_pinned_downloads_carry_a_hash_and_a_revision(self):
-            for entry in (LLAMA_ZIP, CUDART_ZIP):
+            for entry in (LLAMA_ZIP_12_4, CUDART_ZIP_12_4, LLAMA_ZIP_13_3, CUDART_ZIP_13_3):
                 self.assertRegex(entry[2], r"^[0-9a-f]{64}$")
+            # Each pair belongs to its build, all from the pinned release.
+            for build in ENGINE_BUILDS.values():
+                version = build.name.split("-")[1]
+                self.assertIn(f"-{version}-", build.llama_zip[0])
+                self.assertIn(f"-{version}-", build.cudart_zip[0])
+                self.assertIn(LLAMA_TAG, build.llama_zip[0])
+            self.assertEqual(LLAMA_ZIP_13_3[2], "86c6546685ffe2f0954bac062d0bdb347694a2b5eee6f5ddeb1bbfe82d2be1b6")
+            self.assertEqual(CUDART_ZIP_13_3[2], "1462a050eb4c684921ba51dcc4cc488a036674c3e73e9945ee705b854808d03e")
             self.assertRegex(MODEL_SHA256, r"^[0-9a-f]{64}$")
             self.assertIn(f"/resolve/{MODEL_REVISION}/", MODEL_URL)
             self.assertNotIn("/resolve/main/", MODEL_URL)
@@ -1504,6 +2178,631 @@ def self_test() -> int:
                 (self.tmp / "cublas64_12.dll").write_bytes(b"1")
                 (self.tmp / "cudnn64_9.dll").write_bytes(b"1")
                 self.assertTrue(check_gpu_whisper().ok)
+
+        # --- 0.1.3: card, driver and engine build ---
+        def test_nvidia_smi_query_is_parsed(self):
+            # A real line from an RTX 5090 Laptop GPU (fields as GPU_QUERY_FIELDS, with units).
+            gpus = parse_gpu_query("NVIDIA GeForce RTX 5090 Laptop GPU, 12.0, 621.24, 24463 MiB\n")
+            self.assertEqual(gpus, [RTX5090])
+            self.assertEqual(GPU_QUERY_FIELDS, ("name", "compute_cap", "driver_version", "memory.total"))
+            # Two cards, one compute capability not available.
+            gpus = parse_gpu_query("NVIDIA GeForce RTX 4070 Laptop GPU, 8.9, 566.36, 8188 MiB\r\n"
+                                   "NVIDIA GeForce GTX 1080, [N/A], 566.36, 8192 MiB\r\n")
+            self.assertEqual([g.compute_cap for g in gpus], [(8, 9), None])
+            self.assertEqual(gpus[1].memory_mib, "8192")
+            # The older query (no compute_cap, no units).
+            gpus = parse_gpu_query("NVIDIA GeForce RTX 4070 Laptop GPU, 8188, 566.36", GPU_QUERY_FIELDS_OLD)
+            self.assertEqual(gpus, [GpuInfo("NVIDIA GeForce RTX 4070 Laptop GPU", "8188", "566.36", None)])
+            # driver_version is deprecated (to be removed in CUDA 14.0); a deprecated field answers
+            # with a text. The card and its compute capability are kept.
+            gpus = parse_gpu_query("NVIDIA GeForce RTX 5090 Laptop GPU, 12.0, "
+                                   "[Requested functionality has been deprecated], 24463 MiB\n")
+            self.assertEqual([(g.compute_cap, g.memory_mib) for g in gpus], [((12, 0), "24463")])
+            self.assertEqual(GpuFacts(gpus).highest_compute_cap(), (12, 0))
+            check_gpu(GpuFacts(gpus))      # a driver text that is not a number does not raise
+            # Garbage, error texts, a header, empty.
+            for text in ("", "\n\n", "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver.",
+                         'Field "compute_cap" is not a valid field to query.',
+                         "name, compute_cap, driver_version, memory.total [MiB]", "a, b, c, d", None):
+                self.assertEqual(parse_gpu_query(text), [], text)
+
+        def test_driver_cuda_version_is_parsed(self):
+            self.assertEqual(parse_driver_cuda_version("    CUDA UMD Version                      : 13.5\n"), (13, 5))
+            # Newer drivers: the UMD line wins over the deprecated one, wherever it is.
+            both = ("Driver Version                            : 621.24\n"
+                    "CUDA Version                              : 13.0 (Deprecated. Use CUDA UMD Version instead)\n"
+                    "CUDA UMD Version                          : 13.5\n")
+            self.assertEqual(parse_driver_cuda_version(both), (13, 5))
+            deprecated_text = ("CUDA Version : Deprecated. Use CUDA UMD Version instead\n"
+                               "CUDA UMD Version : 13.5\n")
+            self.assertEqual(parse_driver_cuda_version(deprecated_text), (13, 5))
+            # Older drivers: only 'CUDA Version'.
+            self.assertEqual(parse_driver_cuda_version("Driver Version : 566.36\r\nCUDA Version : 12.7\r\n"), (12, 7))
+            for text in ("", None, "garbage\n", "CUDA Version : N/A", "CUDA UMD Version : Deprecated",
+                         "Failed to initialize NVML: Driver/library version mismatch"):
+                self.assertIsNone(parse_driver_cuda_version(text), text)
+
+        def test_engine_build_rule_table(self):
+            table = [
+                # (compute capability, driver CUDA) -> (build, RTX 50, driver problem)
+                ((None, None), ("cuda-12.4", False, False)),
+                ((None, (13, 5)), ("cuda-12.4", False, False)),
+                (((8, 9), None), ("cuda-12.4", False, False)),
+                (((8, 9), (13, 5)), ("cuda-12.4", False, False)),      # decision A
+                (((11, 9), (13, 5)), ("cuda-12.4", False, False)),
+                (((12, 0), (13, 5)), ("cuda-13.3", True, False)),
+                (((12, 0), (13, 3)), ("cuda-13.3", True, False)),
+                (((12, 1), (14, 0)), ("cuda-13.3", True, False)),
+                (((12, 0), (13, 2)), ("cuda-13.3", True, True)),
+                (((12, 0), (12, 8)), ("cuda-13.3", True, True)),
+                (((12, 0), None), ("cuda-13.3", True, True)),
+            ]
+            for (cap, cuda), (build, rtx50, problem) in table:
+                choice = choose_engine_build(cap, cuda)
+                self.assertEqual((choice.build.name, choice.rtx50, bool(choice.driver_problem)),
+                                 (build, rtx50, problem), (cap, cuda))
+            text = choose_engine_build((12, 0), (12, 8)).driver_problem
+            self.assertIn("Update the NVIDIA driver (CUDA 13.3 or newer needed", text)
+            self.assertIn("CUDA 12.8", text)
+            self.assertIn("The CUDA 12.4 engine is known to crash on RTX 50 cards.", text)
+            self.assertIn("could not be read", choose_engine_build((12, 0), None).driver_problem)
+            # Several cards: the newest one decides; unknown ones are ignored.
+            self.assertEqual(GpuFacts([RTX4070, RTX5090]).highest_compute_cap(), (12, 0))
+            unknown = GpuInfo("x", "", "566.36", None)
+            self.assertEqual(GpuFacts([unknown, RTX4070]).highest_compute_cap(), (8, 9))
+            self.assertIsNone(GpuFacts([unknown]).highest_compute_cap())
+            self.assertIsNone(GpuFacts([]).highest_compute_cap())
+            self.assertEqual(engine_choice_for(GpuFacts([RTX4070, RTX5090], (13, 5))).build, BUILD_CUDA_13_3)
+
+        def test_reading_the_card_degrades_safely(self):
+            sample_line = "NVIDIA GeForce RTX 5090 Laptop GPU, 12.0, 621.24, 24463 MiB\n"
+
+            def run_with(answers):
+                calls = []
+
+                def fake(cmd, timeout=30):
+                    calls.append(cmd[1])
+                    return answers.get(cmd[1], (-1, "[WinError 2] The system cannot find the file specified"))
+                with mock.patch.object(this, "_run", side_effect=fake):
+                    facts = real_read_gpu_facts()
+                return facts, calls
+
+            new_query = f"--query-gpu={','.join(GPU_QUERY_FIELDS)}"
+            old_query = f"--query-gpu={','.join(GPU_QUERY_FIELDS_OLD)}"
+            # No nvidia-smi (or a timeout): asked once, nothing more.
+            facts, calls = run_with({})
+            self.assertEqual((facts.gpus, facts.driver_cuda, calls), ([], None, [new_query]))
+            # An nvidia-smi without compute_cap: the old query, and no 'nvidia-smi -q'.
+            facts, calls = run_with({new_query: (2, 'Field "compute_cap" is not a valid field to query.'),
+                                     old_query: (0, "NVIDIA GeForce GTX 1080, 8192, 551.86\n")})
+            self.assertEqual(calls, [new_query, old_query])
+            self.assertEqual((facts.gpus[0].compute_cap, facts.highest_compute_cap()), (None, None))
+            self.assertEqual(engine_choice_for(facts).build, BUILD_CUDA_12_4)
+            # RTX 4070: no 'nvidia-smi -q'.
+            facts, calls = run_with({new_query: (0, "NVIDIA GeForce RTX 4070 Laptop GPU, 8.9, 566.36, 8188 MiB\n")})
+            self.assertEqual(calls, [new_query])
+            # RTX 5090: the driver's CUDA version is read.
+            facts, calls = run_with({new_query: (0, sample_line), "-q": (0, "CUDA UMD Version : 13.5\n")})
+            self.assertEqual((calls, facts.driver_cuda), ([new_query, "-q"], (13, 5)))
+            self.assertEqual(engine_choice_for(facts).build, BUILD_CUDA_13_3)
+            # 'nvidia-smi -q' times out or prints garbage: unknown, so the driver must be checked.
+            for answer in ((-1, "timed out after 30 seconds"), (0, "garbage")):
+                facts, _ = run_with({new_query: (0, sample_line), "-q": answer})
+                self.assertIsNone(facts.driver_cuda)
+                self.assertTrue(engine_choice_for(facts).driver_problem)
+            # check_gpu reads the first card as before.
+            item = check_gpu(GpuFacts([RTX4070]))
+            self.assertTrue(item.ok)
+            self.assertEqual(item.detail, "NVIDIA GeForce RTX 4070 Laptop GPU, 8188 MiB, driver 566.36")
+            self.assertFalse(check_gpu(GpuFacts([])).ok)
+
+        def _engine(self, dlls=("cublas64_12.dll", "cublasLt64_12.dll"), build_marker=None, folder=None) -> dict:
+            folder = self.tmp / "engine" if folder is None else folder
+            folder.mkdir(parents=True, exist_ok=True)
+            for name in ("llama-server.exe", "llama.dll", "ggml-cuda.dll") + tuple(dlls):
+                (folder / name).write_bytes(b"1")
+            if build_marker is not None:
+                (folder / ENGINE_BUILD_MARKER).write_text(build_marker, encoding="utf-8")
+            return {"llm": {"server_binary": str(folder / "llama-server.exe")}}
+
+        def test_installed_build_from_marker_or_dll_names(self):
+            folder = self.tmp / "engine"
+            folder.mkdir()
+            self.assertIsNone(installed_engine_build(folder))
+            self.assertIsNone(installed_engine_build(self.tmp / "missing"))
+            (folder / "cublas64_12.dll").write_bytes(b"1")
+            (folder / "cublasLt64_12.dll").write_bytes(b"1")
+            self.assertEqual(installed_engine_build(folder), "cuda-12.4")
+            (folder / "cublas64_13.dll").write_bytes(b"1")          # both generations, no marker: 13
+            self.assertEqual(installed_engine_build(folder), "cuda-13.x")
+            (folder / ENGINE_BUILD_MARKER).write_text("cuda-12.4\n", encoding="utf-8")   # the marker wins
+            self.assertEqual(installed_engine_build(folder), "cuda-12.4")
+            (folder / ENGINE_BUILD_MARKER).write_text("cuda-13.3\n", encoding="utf-8")
+            self.assertEqual(installed_engine_build(folder), "cuda-13.3")
+            for garbage in ("", "\n", "hello", "cuda-13.3; rm -rf", "CUDA 13.3"):
+                (folder / ENGINE_BUILD_MARKER).write_text(garbage, encoding="utf-8")
+                self.assertEqual(installed_engine_build(folder), "cuda-13.x", garbage)   # back to the DLL names
+            self.assertTrue(is_cuda_12_build("cuda-12.4"))
+            self.assertFalse(is_cuda_12_build("cuda-13.x") or is_cuda_12_build(None))
+
+        def test_install_writes_the_build_marker_only_when_all_files_are_placed(self):
+            src = self.tmp / "unpacked"
+            src.mkdir()
+            names = ("llama-server.exe", "llama.dll", "ggml-cuda.dll", "cublas64_13.dll")
+            for name in names:
+                (src / name).write_bytes(b"1")
+            folder = self.tmp / "engine"
+            folder.mkdir()
+            (folder / ENGINE_BUILD_MARKER).write_text("cuda-12.4\n", encoding="utf-8")   # an older install
+            cancel = threading.Event()
+            cancel.set()
+            with self.assertRaises(SetupCancelled):
+                _place_engine_files([src / n for n in names], folder, cancel, "cuda-13.3")
+            self.assertFalse((folder / ENGINE_BUILD_MARKER).exists())       # never names a half-replaced folder
+            text = (folder / LLAMA_INCOMPLETE_MARKER).read_text(encoding="utf-8")
+            self.assertIn("build: cuda-13.3", text)
+            self.assertNotIn(INCOMPLETE_ALL_PLACED, text)
+            marker = _place_engine_files([src / n for n in names], folder, None, "cuda-13.3")
+            self.assertEqual((folder / ENGINE_BUILD_MARKER).read_text(encoding="utf-8").strip(), "cuda-13.3")
+            self.assertIn(INCOMPLETE_ALL_PLACED, marker.read_text(encoding="utf-8"))
+            self.assertEqual(installed_engine_build(folder), "cuda-13.3")
+
+        def test_running_engine_is_not_replaced(self):
+            src = self.tmp / "unpacked"
+            src.mkdir()
+            names = ("llama-server.exe", "llama.dll", "ggml-base.dll", "cublas64_13.dll")
+            for name in names:
+                (src / name).write_bytes(b"new")
+            folder = self.tmp / "engine"
+            folder.mkdir()
+            for name in names[:3]:
+                (folder / name).write_bytes(b"old")
+            (folder / ENGINE_BUILD_MARKER).write_text("cuda-12.4\n", encoding="utf-8")
+            # A DLL the running engine has loaded: refused before anything is changed.
+            with mock.patch.object(this, "_file_in_use", side_effect=lambda p: p.name == "ggml-base.dll"):
+                with self.assertRaises(SetupError) as ctx:
+                    _place_engine_files([src / n for n in names], folder, None, "cuda-13.3")
+            self.assertIn("ggml-base.dll", str(ctx.exception))
+            self.assertIn("Stop Engine", str(ctx.exception))
+            self.assertFalse((folder / LLAMA_INCOMPLETE_MARKER).exists())
+            self.assertEqual(installed_engine_build(folder), "cuda-12.4")
+            self.assertEqual([(folder / n).read_bytes() for n in names[:3]], [b"old"] * 3)
+            self.assertFalse((folder / "cublas64_13.dll").exists())
+            self.assertTrue(all((src / n).exists() for n in names))
+            # The install refuses before downloading while llama-server.exe in bin/llama is in use.
+            fetched = []
+            with mock.patch.object(this, "_file_in_use", side_effect=lambda p: p.name == "llama-server.exe"), \
+                    mock.patch.object(this, "download_file", side_effect=lambda *a, **k: fetched.append(a)), \
+                    mock.patch.object(this, "DOWNLOAD_DIR", self.tmp / "downloads"):
+                with self.assertRaises(SetupError) as ctx:
+                    install_llama(lambda m: None, None, None, "cuda-13.3")
+            self.assertEqual(fetched, [])
+            self.assertIn("llama-server.exe", str(ctx.exception))
+            # install_missing reports it as a SetupError, not as a raw PermissionError.
+            with mock.patch.object(this, "_file_in_use", return_value=True):
+                errors = install_missing([Item("llama", "engine", False, "", can_install=True,
+                                               engine_build="cuda-13.3")], lambda m: None)
+            self.assertEqual(len(errors), 1)
+            self.assertNotIn("PermissionError", errors[0])
+            # The real test: a missing file, a folder and a closed file are not in use.
+            self.assertFalse(_file_in_use(self.tmp / "missing.dll"))
+            self.assertFalse(_file_in_use(folder))
+            self.assertFalse(_file_in_use(folder / "llama.dll"))
+            self.assertEqual((folder / "llama.dll").read_bytes(), b"old")
+            if sys.platform == "win32":
+                # The running interpreter's own .exe is loaded, like a running llama-server.exe.
+                self.assertTrue(_file_in_use(Path(sys.executable)))
+
+        def test_rtx50_with_the_cuda_12_4_build_is_offered_the_switch(self):
+            cfg = self._engine(folder=this.LLAMA_DIR)          # bin/llama, where the install writes
+            good = GpuFacts([RTX5090], (13, 5))
+            item = check_llama(cfg, good, 0)
+            self.assertEqual((item.ok, item.required, item.can_install), (False, True, True))
+            self.assertEqual((item.engine_build, item.download_bytes), ("cuda-13.3", 589_807_162))
+            self.assertIn("The CUDA 12.4 build is installed. On RTX 50 cards it can crash (\"GPU is lost\")",
+                          item.detail)
+            self.assertIn("switch to the CUDA 13.3 build (590 MB download)", item.detail)
+            self.assertEqual(total_download_bytes([item]), 589_807_162)
+            # Driver too old: nothing to install, a warning only (also after an explicit 12.4 choice).
+            item = check_llama(cfg, GpuFacts([RTX5090], (12, 8)), 0)
+            self.assertEqual((item.ok, item.required, item.can_install, item.alternative_build),
+                             (False, False, False, ""))
+            self.assertIn("Update the NVIDIA driver", item.detail)
+            self.assertEqual(item.help_url, NVIDIA_DRIVER_URL)
+            # A 12.4 engine named in config.json outside bin/llama: the install would not
+            # replace it, so no (endless) offer; a warning that says what to do.
+            outside = self._engine()
+            for facts in (good, GpuFacts([RTX5090], (12, 8))):
+                item = check_llama(outside, facts, 0)
+                self.assertEqual((item.ok, item.required, item.can_install, item.alternative_build),
+                                 (False, False, False, ""), facts)
+                self.assertIn("remove llm.server_binary from config.json", item.detail)
+            # The 13.3 build (marker; or the DLL left behind by a switch): fine.
+            cfg = self._engine(dlls=("cublas64_13.dll",), build_marker="cuda-13.3\n")
+            self.assertTrue(check_llama(cfg, good, 0).ok)
+            # A 13.3 engine and a driver CUDA version that could not be read (nvidia-smi -q
+            # failed once): still OK, no 12.4 suggested. A driver read as too old still offers.
+            item = check_llama(cfg, GpuFacts([RTX5090], None), 0)
+            self.assertEqual((item.ok, item.alternative_build), (True, ""))
+            self.assertIn("could not be read", item.detail)
+            self.assertFalse(check_llama(cfg, GpuFacts([RTX5090], (12, 8)), 0).ok)
+
+        def test_cards_before_rtx50_are_unchanged(self):
+            for marker, dlls in ((None, ("cublas64_12.dll",)), ("cuda-13.3\n", ("cublas64_13.dll",)), (None, ())):
+                folder = self.tmp / "engine"
+                shutil.rmtree(folder, ignore_errors=True)
+                cfg = self._engine(dlls=dlls, build_marker=marker)
+                for facts in (GpuFacts([RTX4070]), GpuFacts([RTX4070], (13, 5)), GpuFacts([])):
+                    self.assertTrue(check_llama(cfg, facts, 0).ok, (marker, dlls, facts))
+            item = check_llama({"llm": {"server_binary": str(self.tmp / "none" / "llama-server.exe")}},
+                               GpuFacts([RTX4070]), 0)
+            self.assertEqual((item.ok, item.can_install, item.engine_build, item.download_bytes),
+                             (False, True, "cuda-12.4", 746_455_173))
+
+        def test_rtx50_with_an_old_driver_offers_12_4_only_as_an_explicit_choice(self):
+            missing = {"llm": {"server_binary": str(self.tmp / "none" / "llama-server.exe")}}
+            old = GpuFacts([RTX5090], (12, 8))
+            item = check_llama(missing, old, 0)
+            self.assertEqual((item.ok, item.required, item.can_install), (False, True, False))
+            self.assertEqual((item.alternative_build, item.engine_build, item.download_bytes), ("cuda-12.4", "", 0))
+            self.assertIn("Update the NVIDIA driver", item.detail)
+            self.assertIn("known to crash", RTX50_CUDA_12_4_WARNING)
+            choose_alternative_build(item)
+            self.assertEqual((item.can_install, item.engine_build, item.alternative_build, item.download_bytes),
+                             (True, "cuda-12.4", "", 746_455_173))
+            # A 13.x engine with a driver that cannot run it: the same offer.
+            item = check_llama(self._engine(dlls=("cublas64_13.dll",)), old, 0)
+            self.assertEqual((item.ok, item.can_install, item.alternative_build), (False, False, "cuda-12.4"))
+            self.assertIn("CUDA 13.x build is installed", item.detail)
+            # With a good driver, no choice is needed.
+            item = check_llama(missing, GpuFacts([RTX5090], (13, 5)), 0)
+            self.assertEqual((item.can_install, item.engine_build, item.alternative_build), (True, "cuda-13.3", ""))
+            # Build not known (no runtime DLLs in the folder, no marker): not blocked, a note.
+            shutil.rmtree(self.tmp / "engine")
+            item = check_llama(self._engine(dlls=()), GpuFacts([RTX5090], (13, 5)), 0)
+            self.assertTrue(item.ok)
+            self.assertIn("build not known", item.detail)
+
+        def test_install_fetches_the_chosen_pair(self):
+            fetched = []
+
+            def fake_download(url, dest, size, log, progress, cancel, sha256):
+                fetched.append((dest.name, size, sha256))
+                raise SetupError("stop here")
+            with mock.patch.object(this, "download_file", side_effect=fake_download), \
+                    mock.patch.object(this, "DOWNLOAD_DIR", self.tmp / "downloads"):
+                for build, facts, expected in (
+                        ("cuda-13.3", GpuFacts([]), LLAMA_ZIP_13_3),
+                        ("cuda-12.4", GpuFacts([RTX5090], (12, 8)), LLAMA_ZIP_12_4),   # the explicit choice
+                        ("", GpuFacts([RTX4070]), LLAMA_ZIP_12_4),
+                        ("", GpuFacts([RTX5090], (13, 5)), LLAMA_ZIP_13_3)):
+                    fetched.clear()
+                    with mock.patch.object(this, "read_gpu_facts", return_value=facts):
+                        with self.assertRaises(SetupError):
+                            install_llama(lambda m: None, None, None, build)
+                    self.assertEqual(fetched, [expected], build)
+                # RTX 50 with an old driver and no explicit choice: refused before any download.
+                fetched.clear()
+                with mock.patch.object(this, "read_gpu_facts", return_value=GpuFacts([RTX5090], (12, 8))):
+                    with self.assertRaises(SetupError) as ctx:
+                        install_llama(lambda m: None, None, None)
+                self.assertEqual(fetched, [])
+                self.assertIn("Update the NVIDIA driver", str(ctx.exception))
+                # Smart App Control on: refused before any download.
+                with mock.patch.object(this, "smart_app_control_state", return_value=1):
+                    with self.assertRaises(SetupError) as ctx:
+                        install_llama(lambda m: None, None, None, "cuda-13.3")
+                self.assertEqual(fetched, [])
+                self.assertIn("Smart App Control is on", str(ctx.exception))
+            # install_missing hands the item's build to the installer.
+            got = []
+            with mock.patch.dict(INSTALLERS, {"llama": lambda log, progress, cancel, build="": got.append(build)}):
+                item = Item("llama", "engine", False, "", can_install=True, engine_build="cuda-12.4")
+                self.assertEqual(install_missing([item], lambda m: None), [])
+            self.assertEqual(got, ["cuda-12.4"])
+
+        def test_incomplete_marker_is_retested_once_and_cleared(self):
+            src = self.tmp / "unpacked"
+            src.mkdir()
+            names = ("llama-server.exe", "llama.dll", "ggml-cuda.dll",
+                     "cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")
+            for name in names:
+                (src / name).write_bytes(b"1")
+            folder = self.tmp / "engine"
+            _place_engine_files([src / n for n in names], folder, None, "cuda-12.4")
+            cfg = {"llm": {"server_binary": str(folder / "llama-server.exe")}}
+            marker = folder / LLAMA_INCOMPLETE_MARKER
+            # Still failing: the reason is shown, the install is offered, the marker stays.
+            reason = engine_failure_text(3236495362, "")
+            with mock.patch.object(this, "run_engine_version", return_value=(False, reason)) as ran:
+                item = check_llama(cfg, GpuFacts([RTX4070]), 0)
+            self.assertEqual(ran.call_count, 1)
+            self.assertEqual((item.ok, item.can_install), (False, True))
+            self.assertIn("0xC0E90002", item.detail)
+            self.assertIn("Smart App Control", item.detail)
+            self.assertTrue(marker.exists())
+            # The cause is gone: OK, marker removed, no further run.
+            with mock.patch.object(this, "run_engine_version", return_value=(True, "")) as ran:
+                self.assertTrue(check_llama(cfg, GpuFacts([RTX4070]), 0).ok)
+                self.assertEqual(ran.call_count, 1)
+                self.assertFalse(marker.exists())
+                self.assertTrue(check_llama(cfg, GpuFacts([RTX4070]), 0).ok)
+                self.assertEqual(ran.call_count, 1)
+            # A marker of 0.1.2 (no build line) with the files there: retested as well.
+            marker.write_text("An install of the LLM engine into this folder did not finish.\n"
+                              "Run the setup check again; it repeats the install.\n", encoding="utf-8")
+            with mock.patch.object(this, "run_engine_version", return_value=(True, "")) as ran:
+                self.assertTrue(check_llama(cfg, GpuFacts([RTX4070]), 0).ok)
+                self.assertEqual(ran.call_count, 1)
+            # A marker of 0.1.2 where the CUDA runtime DLLs (moved last by 0.1.2) are missing:
+            # interrupted, never run, the marker stays.
+            old_text = ("An install of the LLM engine into this folder did not finish.\n"
+                        "Run the setup check again; it repeats the install.\n")
+            for missing in ("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll"):
+                marker.write_text(old_text, encoding="utf-8")
+                (folder / missing).unlink()
+                item = check_llama(cfg, GpuFacts([RTX4070]), 0)
+                self.assertEqual((item.ok, item.can_install), (False, True), missing)
+                self.assertIn("interrupted", item.detail)
+                self.assertTrue(marker.exists())
+                (folder / missing).write_bytes(b"1")
+            # An interrupted install of this version (not all files placed) is never run
+            # (setUp's stand-in fails the test if it is).
+            marker.write_text("An install ...\nbuild: cuda-12.4\n", encoding="utf-8")
+            item = check_llama(cfg, GpuFacts([RTX4070]), 0)
+            self.assertEqual((item.ok, item.can_install), (False, True))
+            self.assertIn("interrupted", item.detail)
+
+        def test_exit_codes_are_explained(self):
+            self.assertEqual(describe_exit_code(3236495362),
+                             "exit code 3236495362 (0xC0E90002): Windows (Smart App Control / Code Integrity) "
+                             "blocked the engine")
+            self.assertEqual(describe_exit_code(-1058471934), describe_exit_code(3236495362))
+            self.assertEqual(describe_exit_code(0xC0000135), "exit code 3221225781 (0xC0000135): a DLL is missing")
+            self.assertEqual(describe_exit_code(-1073741515), describe_exit_code(0xC0000135))
+            self.assertEqual(describe_exit_code(0xC0000409),
+                             "exit code 3221226505 (0xC0000409): the engine stopped itself after an error")
+            self.assertEqual(describe_exit_code(1), "exit code 1 (0x00000001)")
+            self.assertEqual(describe_exit_code(-1), "exit code 4294967295 (0xFFFFFFFF)")
+            self.assertTrue(engine_failure_text(1, "").endswith("It printed nothing."))
+            self.assertIn("It printed: error: x", engine_failure_text(1, "  error: x\n"))
+            self.assertLessEqual(len(engine_failure_text(1, "y" * 5000)), 400)
+            self.assertIn("did not answer '--version' within 60 s", engine_timeout_text(60))
+            self.assertIn("Smart App Control", engine_timeout_text(60))
+            # The program that stopped is named (default: the engine).
+            self.assertEqual(describe_exit_code(0xC0000409, "the web server"),
+                             "exit code 3221226505 (0xC0000409): the web server stopped itself after an error")
+            self.assertTrue(describe_exit_code(-1058471934, "ytc.exe").endswith("blocked ytc.exe"))
+            self.assertNotIn("engine", describe_exit_code(0xC0000409, "the web server"))
+            # A missing DLL names the Visual C++ runtime; other codes do not.
+            self.assertIn(VC_REDIST_URL, engine_failure_text(-1073741515, ""))
+            self.assertIn("a DLL is missing (usually the Microsoft Visual C++", engine_failure_text(0xC0000135, ""))
+            self.assertNotIn("Visual C++", engine_failure_text(0xC0E90002, ""))
+            self.assertEqual(dll_missing_hint(1), "")
+
+        def test_missing_vc_runtime_is_found_and_blocks_the_engine_install(self):
+            names = list(VC_RUNTIME_DLLS)
+            a, b = self.tmp / "a", self.tmp / "b"
+            a.mkdir()
+            b.mkdir()
+            self.assertEqual(real_vc_runtime_missing([a, b, self.tmp / "gone"]), names)
+            for name in names[:2]:
+                (a / name).write_bytes(b"1")
+            for name in names[2:]:
+                (b / name).write_bytes(b"1")
+            self.assertEqual(real_vc_runtime_missing([a]), names[2:])
+            self.assertEqual(real_vc_runtime_missing([self.tmp / "gone", a, b]), [])
+            self.assertIsNone(check_vc_runtime([]))
+            item = check_vc_runtime(["vcomp140.dll"])
+            self.assertEqual((item.key, item.ok, item.required, item.can_install), ("vcredist", False, True, False))
+            self.assertIn("vcomp140.dll", item.detail)
+            self.assertEqual(item.help_url, VC_REDIST_URL)
+            # The default folders: the engine folder and System32 come first.
+            folders = _vc_runtime_folders()
+            self.assertEqual(folders[0], LLAMA_DIR)
+            self.assertIn(folders[1].name.lower(), ("system32", "sysnative"))
+            # No engine yet / failing start test: the install is not offered while the runtime
+            # is missing (it would fail with 'a DLL is missing' again and again).
+            cfg = {}
+            item = check_llama(cfg, GpuFacts([RTX4070]), 0, ["vcomp140.dll"])
+            self.assertEqual((item.ok, item.can_install), (False, False))
+            self.assertIn("Visual C++", item.detail)
+            self.assertEqual(item.help_url, VC_REDIST_URL)
+            self.assertTrue(check_llama(cfg, GpuFacts([RTX4070]), 0, []).can_install)
+            with mock.patch.object(this, "vc_runtime_missing", return_value=["msvcp140.dll"]), \
+                    mock.patch.object(this, "download_file",
+                                      side_effect=AssertionError("must not download")):
+                with self.assertRaises(SetupError) as raised:
+                    install_llama(lambda _line: None, None, None)
+                self.assertIn("msvcp140.dll", str(raised.exception))
+                self.assertIn(VC_REDIST_URL, str(raised.exception))
+
+        def test_ytc_version_runs_without_error_windows_and_explains_the_code(self):
+            exe = self.tmp / "ytc.exe"
+            entered = []
+
+            class Boxes:
+                def __enter__(self):
+                    entered.append(True)
+
+                def __exit__(self, *exc):
+                    return False
+            with mock.patch.object(this, "_NoErrorBoxes", Boxes), \
+                    mock.patch.object(this, "_run", return_value=(-1073741515, "")):
+                found, problem = ytc_version(exe)
+            self.assertEqual(entered, [True])
+            self.assertIsNone(found)
+            self.assertIn("(0xC0000135): a DLL is missing", problem)
+            self.assertIn(VC_REDIST_URL, problem)
+
+        def test_python_probe_child_writes_utf8(self):
+            done = subprocess.CompletedProcess([], 0, "C:\\Users\\José\\x\n", "")
+            with mock.patch.object(subprocess, "run", return_value=done) as run, \
+                    mock.patch.object(this, "python_exe", return_value=Path("python.exe")):
+                self.assertEqual(_run_python_probe("print(1)", []), "C:\\Users\\José\\x\n")
+            env = run.call_args[1]["env"]
+            self.assertEqual((env["PYTHONIOENCODING"], env["PYTHONUTF8"]), ("utf-8", "1"))
+            self.assertEqual(run.call_args[1]["encoding"], "utf-8")
+            self.assertIn("PATH", {k.upper() for k in env})              # the rest of the environment is kept
+
+        def test_stream_cancel_works_while_the_child_is_silent(self):
+            release = threading.Event()
+            self.addCleanup(release.set)
+
+            class SilentOut:
+                def __iter__(self):
+                    yield "Downloading nvidia_cudnn_cu12 (700 MB)\n"
+                    release.wait(30)          # a long download: no further line
+
+            class FakeProc:
+                pid = 4242
+                stdout = SilentOut()
+
+                def wait(self):
+                    return 0
+            cancel = threading.Event()
+            logged = []
+
+            def log(line):
+                logged.append(line)
+                cancel.set()                  # the user presses Cancel after the first line
+            with mock.patch.object(subprocess, "Popen", return_value=FakeProc()), \
+                    mock.patch.object(subprocess, "run") as run:
+                started = time.monotonic()
+                with self.assertRaises(SetupCancelled):
+                    _stream(["pip"], log, cancel)
+                self.assertLess(time.monotonic() - started, 5)
+            self.assertEqual(logged, ["Downloading nvidia_cudnn_cu12 (700 MB)"])
+            self.assertEqual(run.call_args[0][0], ["taskkill", "/PID", "4242", "/T", "/F"])
+
+        def test_stream_passes_lines_and_returns_the_exit_code(self):
+            class FakeProc:
+                pid = 1
+                stdout = iter(["one\n", "  \n", "secret\n", "two\r\n"])
+
+                def wait(self):
+                    return 3
+            logged = []
+            with mock.patch.object(subprocess, "Popen", return_value=FakeProc()), \
+                    mock.patch.object(subprocess, "run", side_effect=AssertionError("no taskkill")):
+                code = _stream(["x"], logged.append, threading.Event(), hide=lambda ln: "secret" in ln)
+            self.assertEqual((code, logged), (3, ["one", "two"]))
+
+        def test_engine_version_run_reports_the_reason(self):
+            exe = self.tmp / "llama-server.exe"
+            done = subprocess.CompletedProcess
+
+            def answers(*items):
+                return mock.patch.object(subprocess, "run", side_effect=list(items))
+            with answers(done([], 0, "version: 1 (d7b2896)", "")):
+                self.assertEqual(real_run_engine_version(exe), (True, ""))
+            with answers(done([], 3236495362, "", "")):
+                ok, reason = real_run_engine_version(exe)
+                self.assertFalse(ok)
+                self.assertIn("0xC0E90002", reason)
+                self.assertIn("printed nothing", reason)
+            with answers(subprocess.TimeoutExpired([str(exe)], 60)) as run:
+                ok, reason = real_run_engine_version(exe)
+                self.assertFalse(ok)
+                self.assertIn("within 60 s", reason)
+                self.assertEqual(run.call_args[0][0], [str(exe), "--version"])
+                self.assertEqual(run.call_args[1]["timeout"], ENGINE_VERSION_TIMEOUT_S)
+            blocked = OSError("An Application Control policy has blocked this file")
+            blocked.winerror = WINERROR_APP_CONTROL_BLOCKED
+            with answers(blocked):
+                self.assertIn("Smart App Control", real_run_engine_version(exe)[1])
+            with answers(FileNotFoundError(2, "not found")):
+                self.assertIn("could not start", real_run_engine_version(exe)[1])
+
+        @unittest.skipUnless(sys.platform == "win32", "Windows only")
+        def test_error_mode_is_restored(self):
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32")
+            before = kernel32.GetErrorMode()
+            wanted = SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX
+            with _NoErrorBoxes():
+                inside = kernel32.GetErrorMode()
+            self.assertEqual(inside & wanted, wanted)
+            self.assertEqual(kernel32.GetErrorMode(), before)
+            # Overlapping users (two threads starting programs): the first one
+            # leaving must not restore the mode while the second is still inside.
+            first, second = _NoErrorBoxes(), _NoErrorBoxes()
+            first.__enter__()
+            second.__enter__()
+            first.__exit__(None, None, None)
+            self.assertEqual(kernel32.GetErrorMode() & wanted, wanted)
+            second.__exit__(None, None, None)
+            self.assertEqual(kernel32.GetErrorMode(), before)
+
+        def test_last_log_lines_or_the_empty_sentence(self):
+            log = self.tmp / "llama-server.log"
+            empty = "llama-server.log is empty: the engine stopped before it wrote anything"
+            self.assertEqual(last_log_lines(log), empty)               # missing
+            log.write_text("", encoding="utf-8")
+            self.assertEqual(last_log_lines(log), empty)
+            log.write_text("\n  \r\n", encoding="utf-8")
+            self.assertEqual(last_log_lines(log), empty)
+            log.write_text("".join(f"line {n}\n" for n in range(1, 31)), encoding="utf-8")
+            self.assertEqual(last_log_lines(log).splitlines(), [f"line {n}" for n in range(16, 31)])
+            self.assertEqual(last_log_lines(log, 2), "line 29\nline 30")
+            log.write_bytes(b"ok \xff\xfe broken utf-8\n")
+            self.assertIn("broken utf-8", last_log_lines(log))
+
+        def test_smart_app_control_value_mapping(self):
+            class FakeKey:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            def fake_winreg(value=None, open_error=None, query_error=None):
+                reg = mock.Mock()
+                reg.HKEY_LOCAL_MACHINE, reg.KEY_READ = "HKLM", 0x20019
+                reg.OpenKey.side_effect = open_error if open_error else (lambda *a: FakeKey())
+                reg.QueryValueEx.side_effect = query_error if query_error else (lambda key, name: (value, 4))
+                return reg
+            reg = fake_winreg(1)
+            self.assertEqual(real_smart_app_control_state(reg), 1)
+            self.assertEqual(reg.OpenKey.call_args[0][:2], ("HKLM", SAC_KEY))
+            self.assertEqual(reg.OpenKey.call_args[0][3], reg.KEY_READ)          # read-only
+            self.assertEqual(reg.QueryValueEx.call_args[0][1], "VerifiedAndReputablePolicyState")
+            self.assertEqual(real_smart_app_control_state(fake_winreg(2)), 2)
+            self.assertEqual(real_smart_app_control_state(fake_winreg(0)), 0)
+            for reg in (fake_winreg(query_error=FileNotFoundError(2, "missing")),
+                        fake_winreg(open_error=PermissionError(5, "denied")),
+                        fake_winreg("garbage"), fake_winreg(7), fake_winreg(None)):
+                self.assertEqual(real_smart_app_control_state(reg), 0)
+            item = check_smart_app_control(1)
+            self.assertEqual((item.ok, item.required, item.can_install), (False, True, False))
+            self.assertEqual(item.detail, SAC_ON_MESSAGE)
+            self.assertIn("not code-signed", item.detail)
+            item = check_smart_app_control(2)
+            self.assertEqual((item.ok, item.required), (True, False))
+            self.assertIn("evaluation mode", item.detail)
+            self.assertIsNone(check_smart_app_control(0))
+            # While it is on, the engine download is not offered.
+            item = check_llama({"llm": {"server_binary": str(self.tmp / "none" / "llama-server.exe")}},
+                               GpuFacts([RTX5090], (12, 8)), 1)
+            self.assertEqual((item.can_install, item.alternative_build), (False, ""))
+            self.assertIn("waits until Smart App Control is off", item.detail)
+
+        def test_harmless_huggingface_warnings_are_hidden(self):
+            for line in ("Xet Storage is enabled for this repo, but the 'hf_xet' package is not installed. "
+                         "Falling back to regular HTTP download.",
+                         "C:\\py\\file_download.py:143: UserWarning: `huggingface_hub` cache-system uses symlinks "
+                         "by default to efficiently store duplicated files but your machine does not support them",
+                         "To support symlinks on Windows, you either need to activate Developer Mode"):
+                self.assertTrue(is_harmless_hf_warning(line), line)
+            for line in ("Error while downloading from https://huggingface.co/x: Read timed out.",
+                         "Trying to resume download...", "OSError: disk full",
+                         # Real failures of the Xet transport name hf_xet too: shown.
+                         "ImportError: DLL load failed while importing hf_xet: The specified module could not be found.",
+                         "    from hf_xet import PyXetDownloadInfo, download_files",
+                         "hf_xet.XetObjectNotFoundError: object not found",
+                         "ValueError: To use optimized download using Xet storage, you need to install the "
+                         "hf_xet package. Try `pip install \"huggingface_hub[hf_xet]\"` or `pip install hf_xet`."):
+                self.assertFalse(is_harmless_hf_warning(line), line)
 
         # --- ytc.exe: version check and the download / build decision ---
         VERSION_OK = f"ytc {YTC_VERSION}\n"

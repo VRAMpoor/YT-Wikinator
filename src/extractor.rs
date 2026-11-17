@@ -110,12 +110,17 @@ const NOT_AVAILABLE_YET_MARKERS: &[&str] = &[
 
 /// Output of a helper that could not run at all: a Python module (yt_dlp,
 /// youtube_transcript_api, faster_whisper) or a helper script is not there,
-/// or ffmpeg is missing.
+/// or ffmpeg is missing. A module whose DLL Windows refuses to load (blocked
+/// by Smart App Control, or no VC++ runtime) cannot run either; Python's own
+/// "DLL load failed" prefix is English on every Windows language, the reason
+/// after it is not.
 const HELPER_MISSING_MARKERS: &[&str] = &[
     "No module named",
     "can't open file",
     "ffmpeg not found",
     "ffmpeg is not installed",
+    "DLL load failed",
+    "An Application Control policy has blocked",
 ];
 
 /// True when helper output says YouTube is blocking or rate-limiting this IP.
@@ -187,6 +192,37 @@ fn classify_failure(err: &anyhow::Error) -> TranscriptFailure {
     match classify_failure_text(&format!("{:#}", err)) {
         TranscriptFailure::Other if program_missing => TranscriptFailure::HelperMissing,
         kind => kind,
+    }
+}
+
+/// Start of the name of the temporary folder the audio for Whisper is
+/// downloaded into.
+const AUDIO_DIR_PREFIX: &str = "ytc-audio-";
+
+/// A crawl stopped by force (taskkill /F) never removes its audio folder, so
+/// such folders are removed by a later run once they are this old: long enough
+/// that no Whisper run of another ytc process can still be using one.
+const STALE_AUDIO_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Removes the audio folders below `parent` that a stopped run left behind and
+/// that were last changed at least `max_age` ago. Best effort: a folder that
+/// cannot be read or removed is left for a later run.
+fn remove_stale_audio_dirs(parent: &Path, max_age: std::time::Duration) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(AUDIO_DIR_PREFIX) {
+            continue;
+        }
+        // Not followed: a link is never a folder ytc made.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let is_old = meta.modified().ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age >= max_age);
+        if meta.is_dir() && is_old {
+            let _ = fs::remove_dir_all(entry.path());
+        }
     }
 }
 
@@ -1059,7 +1095,12 @@ impl SubtitleExtractor {
     /// and falls back to CPU, so the name says what is attempted, not what ran;
     /// the device really used and the measured time are printed.
     pub fn transcribe_audio_cuda(&self, video_id: &str) -> Result<Vec<TranscriptCue>> {
-        let temp_dir = tempdir().context("Failed to create temporary directory for audio")?;
+        let temp_root = std::env::temp_dir();
+        remove_stale_audio_dirs(&temp_root, STALE_AUDIO_AGE);
+        let temp_dir = tempfile::Builder::new()
+            .prefix(AUDIO_DIR_PREFIX)
+            .tempdir_in(&temp_root)
+            .context("Failed to create temporary directory for audio")?;
         let audio_template = temp_dir.path().join("audio.%(ext)s");
         let video_url = format!("https://www.youtube.com/watch?v={}", video_id);
 
@@ -1387,6 +1428,49 @@ mod tests {
         assert_eq!(classify_failure_text("HTTP Error 429: Too Many Requests; Premieres in 1 hour"), RateLimited);
         assert_eq!(classify_failure_text("ERROR: [youtube] x: Video unavailable"), Other);
         assert_eq!(classify_failure_text("Whisper produced an empty transcript for video x"), Other);
+        // A Whisper module whose DLL Windows refuses to load is the setup's
+        // problem, not the video's, whatever the language of the reason.
+        assert_eq!(
+            classify_failure_text(
+                "Whisper script failed: Whisper transcription error: ImportError: DLL load failed while importing stream: Eine Anwendungssteuerungsrichtlinie hat diese Datei blockiert."
+            ),
+            HelperMissing
+        );
+        assert_eq!(
+            classify_failure_text(
+                "ImportError: DLL load failed while importing _ext: The specified module could not be found."
+            ),
+            HelperMissing
+        );
+        assert_eq!(
+            classify_failure_text("OSError: [WinError 4551] An Application Control policy has blocked this file"),
+            HelperMissing
+        );
+    }
+
+    #[test]
+    fn audio_folders_left_by_a_stopped_run_are_removed_once_old() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let left = dir.path().join(format!("{}abc123", AUDIO_DIR_PREFIX));
+        fs::create_dir_all(&left).expect("create");
+        fs::write(left.join("audio.m4a.part"), b"partial audio").expect("write");
+        let other = dir.path().join(".tmpXYZ");
+        fs::create_dir_all(&other).expect("create");
+        let file = dir.path().join(format!("{}file", AUDIO_DIR_PREFIX));
+        fs::write(&file, b"not a folder").expect("write");
+
+        // Fresh: another run may still be using it.
+        remove_stale_audio_dirs(dir.path(), STALE_AUDIO_AGE);
+        assert!(left.exists());
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        remove_stale_audio_dirs(dir.path(), std::time::Duration::ZERO);
+        assert!(!left.exists());
+        // Only ytc's own audio folders are touched.
+        assert!(other.exists());
+        assert!(file.exists());
+        // A missing folder is no error.
+        remove_stale_audio_dirs(&dir.path().join("missing"), std::time::Duration::ZERO);
     }
 
     #[test]

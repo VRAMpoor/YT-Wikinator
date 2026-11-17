@@ -155,8 +155,20 @@ fn not_a_database(path: &Path) -> anyhow::Error {
     anyhow::anyhow!("{}: This file is not a YT-Wikinator database of this version.", path.display())
 }
 
+/// What reading the layout of `path` failed with. Only a file that is not an
+/// SQLite database at all is `not_a_database`; a locked, unreadable or
+/// damaged file keeps the real SQLite error, so a good library is never
+/// called incompatible.
+fn schema_error(path: &Path, err: rusqlite::Error) -> anyhow::Error {
+    if err.sqlite_error_code() == Some(rusqlite::ErrorCode::NotADatabase) {
+        not_a_database(path)
+    } else {
+        anyhow::Error::new(err).context(format!("{}: Failed to read the database", path.display()))
+    }
+}
+
 /// Version mark and number of schema objects of the database behind `conn`.
-/// An error means the file is not an SQLite database at all.
+/// See `schema_error` for what an error means.
 fn schema_state(conn: &Connection) -> rusqlite::Result<(i64, i64)> {
     let version = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let objects = conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))?;
@@ -425,9 +437,9 @@ impl Database {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // Looked at before the first write: a file of another kind must not
         // even have its journal mode changed.
-        match schema_state(&conn) {
-            Ok((SCHEMA_VERSION, _)) => {}
-            Ok((0, 0)) => Self::create_schema(&conn, path)?,
+        match schema_state(&conn).map_err(|e| schema_error(path, e))? {
+            (SCHEMA_VERSION, _) => {}
+            (0, 0) => Self::create_schema(&conn, path)?,
             _ => return Err(not_a_database(path)),
         }
         conn.execute_batch(
@@ -2043,7 +2055,8 @@ impl Database {
         )
         .with_context(|| format!("Failed to open {} read-only", other.display()))?;
         src.busy_timeout(std::time::Duration::from_secs(5))?;
-        if !matches!(schema_state(&src), Ok((SCHEMA_VERSION, _))) {
+        let (version, _) = schema_state(&src).map_err(|e| schema_error(other, e))?;
+        if version != SCHEMA_VERSION {
             return Err(not_a_database(other));
         }
 
@@ -3508,6 +3521,23 @@ mod tests {
             let err = Database::open(path).err().expect("refused");
             assert_eq!(err.to_string(), format!("{}: {}", path.display(), NOT_A_DATABASE));
             assert_eq!(std::fs::read(path).expect("read"), bytes, "{} was changed", path.display());
+        }
+    }
+
+    #[test]
+    fn a_database_that_cannot_be_read_is_not_called_another_kind_of_file() {
+        use rusqlite::ffi;
+        let path = Path::new("lib.db");
+        let failure = |code| rusqlite::Error::SqliteFailure(ffi::Error::new(code), None);
+
+        let err = schema_error(path, failure(ffi::SQLITE_NOTADB));
+        assert_eq!(err.to_string(), format!("{}: {}", path.display(), NOT_A_DATABASE));
+
+        // Locked, unreadable, no -wal/-shm possible, damaged: the real reason is kept.
+        for code in [ffi::SQLITE_BUSY, ffi::SQLITE_IOERR, ffi::SQLITE_CANTOPEN, ffi::SQLITE_CORRUPT] {
+            let text = format!("{:#}", schema_error(path, failure(code)));
+            assert!(!text.contains(NOT_A_DATABASE), "{}", text);
+            assert!(text.starts_with(&format!("{}: Failed to read the database: ", path.display())), "{}", text);
         }
     }
 

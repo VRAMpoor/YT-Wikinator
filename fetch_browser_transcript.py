@@ -159,6 +159,16 @@ def not_set_up(reason: str) -> None:
     sys.exit(4)
 
 
+# Playwright's wording when the browser itself is not installed: Edge
+# ("Chromium distribution 'msedge' is not found at ...") or its own Chromium
+# ("Executable doesn't exist at ...").
+BROWSER_MISSING_MARKERS = ("is not found at", "Executable doesn't exist")
+
+
+def browser_missing(error_text: str) -> bool:
+    return any(m in error_text for m in BROWSER_MISSING_MARKERS)
+
+
 def launch(playwright, show: bool):
     """Installed Edge first (a browser every Windows has), then Playwright's Chromium."""
     folder = profile_dir()
@@ -172,14 +182,22 @@ def launch(playwright, show: bool):
         args=["--mute-audio", "--autoplay-policy=user-gesture-required", "--disable-gpu"],
     )
     errors = []
+    all_missing = True
     for channel in ("msedge", None):
         try:
             if channel:
                 return playwright.chromium.launch_persistent_context(channel=channel, **options)
             return playwright.chromium.launch_persistent_context(**options)
         except Exception as e:  # browser missing or profile in use
-            errors.append(f"{channel or 'chromium'}: {str(e).splitlines()[0]}")
-    not_set_up("no usable browser (" + "; ".join(errors) + ")")
+            text = str(e).strip()
+            all_missing = all_missing and browser_missing(text)
+            errors.append(f"{channel or 'chromium'}: {text.splitlines()[0] if text else type(e).__name__}")
+    if all_missing:
+        not_set_up("no usable browser (" + "; ".join(errors) + ")")
+    # A browser is there but did not start (profile in use by another ytc
+    # process, launch timeout, ...): a failure ytc reports, not "not set up".
+    sys.stderr.write("Browser transcript error: the browser did not start (" + "; ".join(errors) + ")\n")
+    sys.exit(1)
 
 
 def read_transcript(page, video_id: str):
@@ -256,5 +274,69 @@ def main() -> None:
     print(json.dumps({"duration_sec": duration, "cues": cues}))
 
 
+def self_test() -> int:
+    """Checks without a browser:  python fetch_browser_transcript.py --self-test"""
+    import io
+    import tempfile
+    import unittest
+    from types import SimpleNamespace
+    from unittest import mock
+
+    edge_missing = Exception("BrowserType.launch_persistent_context: Chromium distribution 'msedge' "
+                             "is not found at C:\\x\\msedge.exe\nRun \"playwright install msedge\"")
+    chromium_missing = Exception("BrowserType.launch_persistent_context: Executable doesn't exist at "
+                                 "C:\\x\\chrome.exe\nplaywright install")
+    profile_in_use = Exception("BrowserType.launch_persistent_context: Target page, context or browser "
+                               "has been closed")
+    launch_timeout = Exception("BrowserType.launch_persistent_context: Timeout 30000ms exceeded.")
+
+    def fake_playwright(*outcomes):
+        answers = list(outcomes)
+
+        def launch_persistent_context(**_options):
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        return SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=launch_persistent_context))
+
+    class Tests(unittest.TestCase):
+        def run_launch(self, *outcomes):
+            with tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch(__name__ + ".profile_dir", return_value=Path(tmp) / PROFILE_DIR_NAME), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                try:
+                    return launch(fake_playwright(*outcomes), show=False), None, err.getvalue()
+                except SystemExit as e:
+                    return None, e.code, err.getvalue()
+
+        def test_markers(self):
+            self.assertTrue(browser_missing(str(edge_missing)))
+            self.assertTrue(browser_missing(str(chromium_missing)))
+            self.assertFalse(browser_missing(str(profile_in_use)))
+            self.assertFalse(browser_missing(str(launch_timeout)))
+
+        def test_edge_starts(self):
+            context, code, _ = self.run_launch("edge context")
+            self.assertEqual((context, code), ("edge context", None))
+
+        def test_no_browser_installed_is_not_set_up(self):
+            _, code, err = self.run_launch(edge_missing, chromium_missing)
+            self.assertEqual(code, 4)
+            self.assertIn("not set up", err)
+
+        def test_launch_failure_is_reported(self):
+            for edge_error in (profile_in_use, launch_timeout):
+                _, code, err = self.run_launch(edge_error, chromium_missing)
+                self.assertEqual(code, 1)
+                self.assertIn("Browser transcript error: the browser did not start", err)
+                self.assertIn(str(edge_error).splitlines()[0], err)
+
+    result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests))
+    return 0 if result.wasSuccessful() else 1
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv[1:]:
+        sys.exit(self_test())
     main()

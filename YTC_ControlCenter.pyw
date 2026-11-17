@@ -13,16 +13,20 @@ folder can be copied to another PC.
 """
 
 import os
+import re
 import sys
 import json
 import time
 import queue
+import shutil
 import socket
+import hashlib
 import sqlite3
 import threading
 import traceback
 import subprocess
 import webbrowser
+import weakref
 from pathlib import Path
 import urllib.request
 import urllib.error
@@ -41,12 +45,31 @@ NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 AUTOSTART_REQUEST = LOG_DIR / "autostart.request"
 LLM_READY_TIMEOUT_S = 300
 YTC_READY_TIMEOUT_S = 30
+# Stop_All.bat leaves this file just before it ends the engine / web server, so
+# that their end is not reported as a crash. Older than this, it is ignored.
+STOP_REQUEST = LOG_DIR / "stop.request"
+STOP_REQUEST_MAX_AGE_S = 60
+# control_center.log is moved to control_center.log.1 at start-up above this size.
+CONTROL_LOG_MAX_BYTES = 5 * 1000 * 1000
+
+
+def rotate_log(path, max_bytes=CONTROL_LOG_MAX_BYTES):
+    """Move a log that has grown above max_bytes to <name>.1 (replacing an
+    older one), so it cannot grow without limit. Never raises: a log another
+    Control Center still holds open is simply left as it is."""
+    path = Path(path)
+    try:
+        if path.stat().st_size > max_bytes:
+            os.replace(path, path.with_name(path.name + ".1"))
+    except OSError:
+        pass
 
 
 def setup_stdio():
     """Under pythonw.exe there is no console (sys.stdout/stderr are None).
     Send prints and tracebacks to logs/control_center.log so failures are visible."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    rotate_log(LOG_DIR / "control_center.log")
     if sys.stdout is None or sys.stderr is None:
         f = open(LOG_DIR / "control_center.log", "a", encoding="utf-8", buffering=1)
         if sys.stdout is None:
@@ -56,6 +79,9 @@ def setup_stdio():
 
 
 _log_file_lock = threading.Lock()
+# The error mode is process-wide: the engine and the web server may start at the
+# same time, and one must not restore it while the other is being created.
+_NO_ERROR_BOXES_LOCK = threading.Lock()
 
 
 def append_log_file(text):
@@ -148,22 +174,48 @@ def _merge_defaults(defaults, loaded):
     return out
 
 
-def load_config():
-    """Read config.json; any missing section or key falls back to the default."""
+def _read_config_file(path):
+    """The parsed config.json. utf-8-sig: an editor or PowerShell 5.1 may have
+    saved it with a byte order mark, which Stop_All.bat / Open_WebUI.bat accept
+    as well. Raises on a file that cannot be read or parsed."""
+    with open(path, "r", encoding="utf-8-sig") as f:
+        return json.load(f)
+
+
+def load_config(path=None, problems=None):
+    """Read config.json; any missing section or key falls back to the default.
+    A file that cannot be read or parsed is described in `problems` (a list),
+    so the window can say so; it is left as it is (see save_config)."""
+    path = CONFIG_PATH if path is None else Path(path)
     loaded = {}
-    if CONFIG_PATH.exists():
+    if path.exists():
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
+            loaded = _read_config_file(path)
         except Exception as e:
-            print(f"config.json could not be read ({e}); using defaults")
+            text = (f"{path.name} could not be read ({e}). The default settings are used. Fix the file and "
+                    f"restart the Control Center; a save from this window first copies it to "
+                    f"{path.name}.bad.")
+            print(text)
+            if problems is not None:
+                problems.append(text)
     return _merge_defaults(DEFAULT_CONFIG, loaded)
 
 
-def save_config(cfg):
+def save_config(cfg, path=None):
+    """Write config.json through a temporary file, so a crash cannot leave half
+    a file. A file that does not parse (a typo of a hand edit) is copied to
+    config.json.bad first instead of being lost."""
+    path = CONFIG_PATH if path is None else Path(path)
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        if path.exists():
+            try:
+                _read_config_file(path)
+            except ValueError:
+                shutil.copyfile(path, path.with_name(path.name + ".bad"))
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
+        os.replace(tmp, path)
         return True
     except Exception as e:
         print(f"Error saving config: {e}")
@@ -259,7 +311,8 @@ REANALYZE_EXPLANATION = (
     "for a large library. ytc prints the number of videos and LLM requests before it starts.\n\n"
     "You can stop it at any time with the same button; videos finished until then keep their new "
     "result. The videos are taken in the order of their last analysis, the one analysed longest ago "
-    "first, so a later run continues with the rest. Afterwards use 'Sync Wiki Files'."
+    "first. '--all' always selects every video again: after a stop this window is set to the number "
+    "of videos left, so that the next run does only the rest. Afterwards use 'Sync Wiki Files'."
 )
 
 
@@ -354,32 +407,173 @@ def kill_process_tree(pid):
     run_quiet(["taskkill", "/PID", str(pid), "/T", "/F"])
 
 
-def tail_text(path, max_lines=12):
+def exit_report(headline, who, code, log_path, show_lines=True, count=15):
+    """The log-pane lines for a child program that has stopped: the headline with
+    its exit code explained (decimal, hex and, for a known Windows code, what it
+    means), then the last lines of its log. An empty or missing log is named as
+    empty instead; `who` names the program in that sentence ('the engine').
+    show_lines=False leaves the log lines out (they are already in the pane)."""
+    name = Path(log_path).name
+    head = f"{headline} ({ytc_setup.describe_exit_code(code, who)}{ytc_setup.dll_missing_hint(code)})."
+    tail = ytc_setup.last_log_lines(log_path, count)
+    # last_log_lines answers with this sentence when there is nothing to show.
+    if tail == f"{name} is empty: the engine stopped before it wrote anything":
+        return [f"{head} {name} is empty: {who} stopped before it wrote anything."]
+    if not show_lines:
+        return [f"{head} Its last lines are above; full log: {log_path}"]
+    return [f"{head} Last lines of {name}:"] + [f"   | {ln}" for ln in tail.splitlines()]
+
+
+def external_stop_requested(now=None):
+    """True when Stop_All.bat asked for the stop in the last minute (it leaves
+    logs/stop.request before it ends the engine and the web server). Their end
+    is then a requested stop, not a crash. Any thread."""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = [ln.rstrip() for ln in f.readlines() if ln.strip()]
-        return lines[-max_lines:]
+        age = (time.time() if now is None else now) - STOP_REQUEST.stat().st_mtime
     except OSError:
-        return []
+        return False
+    return -5 <= age <= STOP_REQUEST_MAX_AGE_S
+
+
+def clear_stop_request():
+    """Called before this window starts the engine / web server: an older
+    request of Stop_All.bat is not about the new process."""
+    try:
+        STOP_REQUEST.unlink()
+    except OSError:
+        pass
+
+
+def ytc_exit_text(code, output):
+    """The exit code of a short ytc command that failed, explained, and that it
+    printed nothing when that is so (a missing DLL or an antivirus kill prints
+    nothing at all)."""
+    text = ytc_setup.describe_exit_code(code, "ytc.exe") + ytc_setup.dll_missing_hint(code)
+    return text if (output or "").strip() else f"{text}; ytc.exe printed nothing"
+
+
+def ytc_failure_text(code, output):
+    """Why a short ytc command failed: what it printed plus its exit code."""
+    output = (output or "").strip()
+    return f"{output} ({ytc_exit_text(code, output)})" if output else ytc_exit_text(code, output)
+
+
+# Setup rows that are never optional although they do not block the start:
+# a warning about the LLM engine build, Smart App Control in evaluation mode.
+SETUP_WARNING_KEYS = ("llama", "sac")
+
+
+def setup_row_title(item):
+    """Title of one row of the setup window."""
+    if item.required:
+        return item.label
+    if item.key in SETUP_WARNING_KEYS:
+        return f"{item.label} (warning)"
+    return f"{item.label} (optional)"
+
+
+class ReanalyzeProgress:
+    """Follows the output of 'ytc reanalyze' (one line at a time) to know how
+    many of the planned videos got a new result."""
+
+    _PLANNED = re.compile(r"^Re-analysing (\d+) video\(s\)")
+    _ANSI = re.compile(r"\x1b\[[0-9;]*m")     # in case colours are not switched off
+
+    def __init__(self):
+        self.total = None
+        self.done = 0
+
+    def feed(self, line):
+        line = self._ANSI.sub("", line).strip()
+        match = self._PLANNED.match(line)
+        if match:
+            self.total = int(match.group(1))
+        elif line.startswith("✓ before:"):
+            self.done += 1
+
+    def resume_limit(self, selection, limit):
+        """For an '--all' run without a limit that ended before every planned
+        video got a new result: the --limit with which the next run does only
+        the rest. 'ytc reanalyze --all' takes every video again, the one
+        analysed longest ago first, so the videos left (and the failed ones)
+        come first. None when no limit is needed (other selections drop the
+        finished videos by themselves; a run with a limit continues with the
+        oldest videos anyway)."""
+        if selection != "--all" or int(limit) > 0 or self.total is None or self.done >= self.total:
+            return None
+        return self.total - self.done
+
+
+def fetch_json(url, timeout=5.0):
+    """GET a JSON object from a local server; None when that fails."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "YTC-ControlCenter"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _same_file(a, b):
+    try:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    except (TypeError, ValueError):
+        return False
+
+
+def ytc_server_mismatch(status, db_path, version=None):
+    """None when the web server that answered /api/status with `status` is one
+    of this app: same version, same database. Otherwise the text that says
+    what differs. A relative db_path of the server is read inside this app
+    folder (the Control Center starts it there)."""
+    version = ytc_setup.YTC_VERSION if version is None else version
+    found = status.get("version") if isinstance(status, dict) else None
+    server_db = status.get("db_path") if isinstance(status, dict) else None
+    problems = []
+    if found != version:
+        problems.append(f"it is ytc {found or '(version not known)'}, this app needs {version}")
+    if isinstance(server_db, str) and server_db:
+        server_path = Path(server_db)
+        if not server_path.is_absolute():
+            server_path = SCRIPT_DIR / server_path
+        if not _same_file(server_path, db_path):
+            problems.append(f"it uses the database {server_path}, this window uses {db_path}")
+    return "; ".join(problems) or None
+
+
+def instance_mutex_name(folder=None):
+    """Name of the mutex that marks a Control Center of this app folder."""
+    folder = SCRIPT_DIR if folder is None else Path(folder)
+    key = os.path.normcase(os.path.abspath(str(folder)))
+    return "YTC_ControlCenter_" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 
 def acquire_single_instance():
-    """True if this is the only Control Center. Otherwise the existing window
-    is brought to the front and False is returned."""
+    """'first' if this is the only Control Center. Otherwise the existing
+    window is brought to the front and 'same' (it belongs to this app folder)
+    or 'other' (another app folder, or a version before 0.1.3) is returned.
+    One Control Center at a time on the whole PC: they would share the ports."""
     if sys.platform != "win32":
-        return True
+        return "first"
     import ctypes
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    # The handle is kept for the life of the process on purpose.
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    # The handles are kept for the life of the process on purpose.
+    ctypes.set_last_error(0)
     acquire_single_instance.handle = kernel32.CreateMutexW(None, False, "YTC_ControlCenter_SingleInstance")
-    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+    running = ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+    ctypes.set_last_error(0)
+    acquire_single_instance.folder_handle = kernel32.CreateMutexW(None, False, instance_mutex_name())
+    same_folder = ctypes.get_last_error() == 183
+    if running:
         user32 = ctypes.windll.user32
         hwnd = user32.FindWindowW(None, APP_TITLE)
         if hwnd:
             user32.ShowWindow(hwnd, 9)  # SW_RESTORE
             user32.SetForegroundWindow(hwnd)
-        return False
-    return True
+        return "same" if same_folder else "other"
+    return "first"
 
 
 def build_ytc_cmd(ytc_bin, db_path, args, llm_port, max_slop, wiki_dir, env=None):
@@ -404,7 +598,9 @@ class YTCControlApp:
         self.root.geometry("1080x820")
         self.root.minsize(960, 740)
 
-        self.cfg = load_config()
+        # A config.json that cannot be read is named in the log pane (below).
+        self._config_problems = []
+        self.cfg = load_config(problems=self._config_problems)
 
         # Process Handles
         self.llama_proc = None
@@ -417,6 +613,15 @@ class YTCControlApp:
         # Bumped by every Stop; a start that was overtaken by a Stop cancels itself.
         self._llm_stop_gen = 0
         self._ytc_stop_gen = 0
+        # Engine / web server processes whose end is already taken care of: reported
+        # once (start-up loop or watcher), or stopped on purpose (Stop, Stop all,
+        # closing the window), which must stay silent. See _claim_exit.
+        self._exit_claimed = weakref.WeakSet()
+        self._exit_lock = threading.Lock()
+        # The ytc.exe whose start-up loop is still waiting; its end is reported there.
+        self._ytc_starting = None
+        # True while the 'start the engine again?' question is open. Main thread only.
+        self._llm_restart_asking = False
         # Running crawl / ingest child processes (see _run_stream).
         self._jobs = set()
         self._jobs_lock = threading.Lock()
@@ -434,12 +639,15 @@ class YTCControlApp:
         self.reanalyze_proc = None
         self._reanalyze_busy = False
         self.reanalyze_dialog = None
+        # After an '--all' run that ended early: the --limit that continues it
+        # with the videos left (see ReanalyzeProgress.resume_limit), else None.
+        self._reanalyze_resume = None
         # ytc.exe path -> (file time, version it printed). Only answers of a
         # ytc.exe that printed its version are stored here.
         self._ytc_version_cache = {}
         self._ytc_version_lock = threading.Lock()
         self._llm_owner_checked = 0.0
-        self._llm_owner_is_llama = False
+        self._llm_owner_names = set()
         try:
             AUTOSTART_REQUEST.unlink()
         except OSError:
@@ -454,6 +662,8 @@ class YTCControlApp:
 
         # Build UI Structure
         self.build_ui()
+        for problem in self._config_problems:
+            self.log(f"⚠️ {problem}")
 
         # Errors inside button handlers and worker threads go to the log pane
         # and logs/control_center.log instead of vanishing under pythonw.
@@ -908,10 +1118,12 @@ class YTCControlApp:
 
             # llama-server opens its port at once but answers /health with 503
             # until the model is loaded, so "port open" is not "ready".
+            # Another program on the port can answer /health with 200 as well
+            # (Open WebUI also uses 8080), so the owner is checked in both cases.
             if not is_port_open(llm_port):
                 llm_state = "stopped"
             elif check_http_alive(f"http://127.0.0.1:{llm_port}/health"):
-                llm_state = "online"
+                llm_state = "online" if self._llm_port_is_ours(llm_port, unknown_is_ours=True) else "blocked"
             elif self._llm_port_is_ours(llm_port):
                 llm_state = "loading"
             else:
@@ -928,17 +1140,19 @@ class YTCControlApp:
             self.ui(self._update_status_labels, llm_state, ytc_state)
             time.sleep(2.0)
 
-    def _llm_port_is_ours(self, llm_port):
-        """Port open but not healthy: is that our llama-server still loading,
-        or some other program sitting on the port? (Lookup cached for 10 s.)"""
+    def _llm_port_is_ours(self, llm_port, unknown_is_ours=False):
+        """Is the program on the LLM port our llama-server, or some other
+        program sitting on the port? (Lookup cached for 10 s.)
+        unknown_is_ours: the answer when no owner could be found at all (for an
+        engine that answers /health, so that a failed lookup does not hide it)."""
         proc = self.llama_proc
         if (proc is not None and proc.poll() is None) or self._llm_start_lock.locked():
             return True
         if time.time() - self._llm_owner_checked > 10:
-            names = {process_image_name(p) for p in pids_listening_on(llm_port)}
-            self._llm_owner_is_llama = "llama-server.exe" in names
+            self._llm_owner_names = {process_image_name(p) for p in pids_listening_on(llm_port)}
             self._llm_owner_checked = time.time()
-        return self._llm_owner_is_llama
+        names = self._llm_owner_names
+        return "llama-server.exe" in names or (unknown_is_ours and not names)
 
     def _update_status_labels(self, llm_state, ytc_state):
         llm_port, ytc_port = self._ports()
@@ -1017,14 +1231,21 @@ class YTCControlApp:
         stop_gen = self._llm_stop_gen
 
         if is_port_open(llm_port):
-            if check_http_alive(health):
-                self.log(f"✓ LLM engine is already running on port {llm_port}.")
-                return True
-            owners = self._port_owners(llm_port)
-            if "llama-server.exe" not in owners:
-                self.log(f"❌ Port {llm_port} is in use by {owners}. The LLM engine cannot start there. "
+            healthy = check_http_alive(health)
+            # Another program can answer /health with 200 as well (Open WebUI
+            # also uses 8080): only a llama-server.exe is taken as the engine.
+            # When no owner can be found at all, a healthy port is still taken.
+            names = {process_image_name(p) or f"PID {p}" for p in pids_listening_on(llm_port)}
+            if (names or not healthy) and "llama-server.exe" not in names:
+                owners = ", ".join(sorted(names)) or "an unknown program"
+                self.log(f"❌ Port {llm_port} is in use by {owners}"
+                         + (", which answers like an engine but is not llama-server.exe" if healthy else "")
+                         + ". The LLM engine cannot start there. "
                          f"Close that program or change llm.port in config.json.")
                 return False
+            if healthy:
+                self.log(f"✓ LLM engine is already running on port {llm_port}.")
+                return True
             self.log(f"⏳ An LLM engine is already loading on port {llm_port}; waiting for it...")
         else:
             llm_bin, searched = find_llama_server(self.cfg)
@@ -1057,8 +1278,12 @@ class YTCControlApp:
 
             self.log(f"🚀 Launching LLM engine: {llm_bin}")
             self.log(f"   | model: {model_p.name}  port: {llm_port}  log: {log_path}")
+            clear_stop_request()
             try:
-                with open(log_path, "wb") as logf:
+                # No Windows error box ('Bad Image' when Smart App Control blocks
+                # a DLL): the engine then ends at once with an exit code that
+                # exit_report explains, instead of waiting for a click.
+                with open(log_path, "wb") as logf, _NO_ERROR_BOXES_LOCK, ytc_setup._NoErrorBoxes():
                     proc = subprocess.Popen(
                         cmd,
                         cwd=str(llm_bin.parent),
@@ -1076,8 +1301,19 @@ class YTCControlApp:
                 self.log("ℹ️ LLM engine start cancelled.")
                 return False
             self.llama_proc = proc
-            self.log(f"⏳ LLM engine started (PID {proc.pid}); loading the model into the GPU...")
+            self.log(f"⏳ LLM engine started (PID {proc.pid}); waiting for it to load the model...")
 
+        try:
+            return self._wait_llm_ready(proc, stop_gen, llm_port, health, log_path)
+        finally:
+            # From here on a watcher reports an engine of ours that stops by itself
+            # (also one that is still loading after the time-out).
+            if proc is not None and proc.poll() is None and self.is_monitoring:
+                threading.Thread(target=self._watch_llm, args=(proc, log_path), daemon=True).start()
+
+    def _wait_llm_ready(self, proc, stop_gen, llm_port, health, log_path):
+        """The start-up wait of _launch_llm_locked. proc is None when an engine
+        that is not ours was already loading. Worker thread."""
         started = time.time()
         while self.is_monitoring and time.time() - started < LLM_READY_TIMEOUT_S:
             if check_http_alive(health):
@@ -1087,12 +1323,17 @@ class YTCControlApp:
                 self.log("ℹ️ LLM engine start cancelled.")
                 return False
             if proc is not None and proc.poll() is not None:
-                self.log(f"❌ LLM engine stopped during start-up (exit code {proc.returncode}). "
-                         f"Last lines of {log_path.name}:")
-                for ln in tail_text(log_path):
-                    self.log(f"   | {ln}")
                 if self.llama_proc is proc:
                     self.llama_proc = None
+                if not self._claim_exit(proc):      # a Stop got there first
+                    self.log("ℹ️ LLM engine start cancelled.")
+                    return False
+                if external_stop_requested():
+                    self.log("ℹ️ LLM engine start ended: it was stopped from outside this window (Stop_All.bat).")
+                    return False
+                for line in exit_report("❌ LLM engine stopped during start-up", "the engine",
+                                        proc.returncode, log_path):
+                    self.log(line)
                 return False
             if proc is None and not is_port_open(llm_port):
                 self.log("❌ The LLM engine that was loading has disappeared.")
@@ -1101,6 +1342,63 @@ class YTCControlApp:
         if self.is_monitoring:
             self.log(f"❌ LLM engine did not become ready within {LLM_READY_TIMEOUT_S}s. See {log_path}")
         return False
+
+    def _claim_exit(self, proc):
+        """True for the first caller only, per process. Whoever reports the end of
+        an engine / web server process, or stops it on purpose, claims it first,
+        so the same end is never reported twice and a requested stop stays
+        silent. Any thread."""
+        with self._exit_lock:
+            if proc in self._exit_claimed:
+                return False
+            self._exit_claimed.add(proc)
+            return True
+
+    def _watch_llm(self, proc, log_path):
+        """Worker thread, started when the start-up wait is over: notices an
+        engine of ours that stops without a Stop, says why and offers a restart."""
+        try:
+            proc.wait()
+        except Exception:
+            return
+        if self.llama_proc is proc:
+            self.llama_proc = None
+        if not self.is_monitoring or not self._claim_exit(proc):
+            return          # stopped on purpose (Stop, Stop all, closing the window)
+        if external_stop_requested():
+            self.log("ℹ️ LLM engine stopped from outside this window (Stop_All.bat).")
+            return
+        if proc.returncode == 1:
+            # What taskkill /F and Task Manager's 'End task' leave: most likely
+            # ended on purpose, so no crash report and no restart question.
+            self.log(f"ℹ️ LLM engine ended ({ytc_setup.describe_exit_code(1)}), most likely from outside "
+                     f"this window (Task Manager, taskkill). Log: {log_path}")
+            self.log("   | Press 'Start Engine' to start it again.")
+            return
+        for line in exit_report("❌ LLM engine stopped", "the engine", proc.returncode, log_path):
+            self.log(line)
+        self.log("   | Press 'Start Engine' to start it again.")
+        self.ui(self._offer_llm_restart, ytc_setup.describe_exit_code(proc.returncode))
+
+    def _offer_llm_restart(self, reason):
+        """Main thread. The question runs from its own Tk callback, not inside
+        _pump_ui_queue, so the queue is not held up while it is open."""
+        if not self.is_monitoring or self._llm_restart_asking:
+            return
+        self._llm_restart_asking = True
+        self.root.after(0, self._ask_llm_restart, reason)
+
+    def _ask_llm_restart(self, reason):
+        try:
+            again = self.is_monitoring and messagebox.askyesno(
+                "LLM engine stopped",
+                f"The LLM engine stopped by itself ({reason}).\n\n"
+                f"The last lines of its log are in the log pane.\n\nStart it again?",
+                icon="warning", default="no", parent=self.root)
+        finally:
+            self._llm_restart_asking = False
+        if again and self.is_monitoring:
+            self.start_llm_server()
 
     def _remember_model_path(self, path_text):
         self.model_entry.delete(0, "end")
@@ -1140,6 +1438,8 @@ class YTCControlApp:
     def _stop_llm_now(self):
         self._llm_stop_gen += 1
         proc, self.llama_proc = self.llama_proc, None
+        if proc is not None:
+            self._claim_exit(proc)      # a requested stop: the watcher stays silent
         llm_port, _ = self._ports()
         threading.Thread(target=self._stop_service,
                          args=("LLM engine", proc, llm_port, "llama-server.exe"), daemon=True).start()
@@ -1154,12 +1454,20 @@ class YTCControlApp:
                 proc.wait(timeout=5)
             except Exception:
                 pass
+        foreign = False
         for pid in pids_listening_on(port):
             name = process_image_name(pid)
             if name == image:
                 kill_process_tree(pid)
             else:
+                foreign = True
                 self.log(f"⚠️ Port {port} is held by {name or f'PID {pid}'}, which is not {image}; left alone.")
+        # taskkill returns before the process is gone; an engine needs a moment
+        # to give back its GPU memory and its port.
+        # (Not when another program holds the port: that one stays.)
+        deadline = time.time() + 5
+        while not foreign and is_port_open(port) and time.time() < deadline:
+            time.sleep(0.25)
         if is_port_open(port):
             self.log(f"⚠️ {label}: port {port} is still in use.")
         else:
@@ -1255,6 +1563,16 @@ class YTCControlApp:
 
         if is_port_open(ytc_port):
             if check_http_alive(probe):
+                # Left running by an older version, another app folder, or
+                # started on another database: say so instead of taking it.
+                # A server that does not answer /api/status is taken as before.
+                status = fetch_json(f"http://127.0.0.1:{ytc_port}/api/status")
+                problem = ytc_server_mismatch(status, self.get_db_path(db_text)) if status else None
+                if problem:
+                    self.log(f"❌ A YTC web server is already running on port {ytc_port}, but not this app's: "
+                             f"{problem}. Stop it (Stop Server), then start it again.")
+                    self.ui(self._offer_ytc_restart, problem, db_text)
+                    return False
                 self.log(f"✓ YTC web server is already running on port {ytc_port}.")
                 return True
             self.log(f"❌ Port {ytc_port} is in use by {self._port_owners(ytc_port)}. "
@@ -1275,10 +1593,12 @@ class YTCControlApp:
         db_path = self.get_db_path(db_text)
         cmd = self.ytc_cmd(ytc_bin, db_path, "serve", "--port", ytc_port)
         self.log(f"🚀 Starting YTC web server on port {ytc_port} (DB: {db_path})...")
+        clear_stop_request()
         try:
             # Output goes to a file, not a pipe: the server then keeps working
             # even if this window is closed while it is left running.
-            with open(log_path, "wb") as logf:
+            # No Windows error box for a blocked or missing DLL (see the engine).
+            with open(log_path, "wb") as logf, _NO_ERROR_BOXES_LOCK, ytc_setup._NoErrorBoxes():
                 proc = subprocess.Popen(
                     cmd,
                     cwd=str(SCRIPT_DIR),
@@ -1296,29 +1616,82 @@ class YTCControlApp:
             self.log("ℹ️ YTC web server start cancelled.")
             return False
         self.ytc_proc = proc
-        threading.Thread(target=self._tail_log_file, args=(log_path, proc, "[Server]"), daemon=True).start()
+        # Until start-up is over (ready, time-out or cancel), an end of this process
+        # is reported as 'during start-up'.
+        self._ytc_starting = proc
+        threading.Thread(target=self._tail_log_file, args=(log_path, proc, "[Server]"),
+                         kwargs={"on_exit": lambda: self._ytc_exited(proc, log_path)}, daemon=True).start()
 
         started = time.time()
         while self.is_monitoring and time.time() - started < YTC_READY_TIMEOUT_S:
             if stop_gen != self._ytc_stop_gen:
                 self.log("ℹ️ YTC web server start cancelled.")
+                self._ytc_start_over(proc)
                 return False
             if proc.poll() is not None:
-                self.log(f"❌ YTC web server stopped during start-up (exit code {proc.returncode}). "
-                         f"See {log_path}")
+                # The log thread says why, after it has copied the last lines of
+                # the log into the pane (see _ytc_exited), so they come first.
                 if self.ytc_proc is proc:
                     self.ytc_proc = None
                 return False
             if check_http_alive(probe):
                 self.log(f"✓ YTC web server is ready (PID {proc.pid}).")
+                self._ytc_start_over(proc)
                 return True
             time.sleep(0.5)
         if self.is_monitoring:
             self.log(f"❌ YTC web server did not answer within {YTC_READY_TIMEOUT_S}s. See {log_path}")
+        self._ytc_start_over(proc)
         return False
 
-    def _tail_log_file(self, log_path, proc, tag):
-        """Copy new lines of a child's log file into the log pane until it exits."""
+    def _offer_ytc_restart(self, problem, db_text):
+        """Main thread: a web server of another version / database runs on our
+        port. Offer to stop it and start this app's one."""
+        if not self.is_monitoring:
+            return
+        if not messagebox.askyesno(
+                "Another web server is running",
+                f"A YTC web server is already running on port {self._ports()[1]}, but not this app's:\n"
+                f"{problem}.\n\nStop it and start this app's web server?",
+                icon="warning", parent=self.root):
+            return
+        if not self._confirm_stop(stops_engine=False, stops_web=True):
+            return
+        _, ytc_port = self._ports()
+
+        def _work():
+            self._stop_service("YTC web server", None, ytc_port, "ytc.exe")
+            if self._launch_ytc(db_text):
+                self.ui(self.open_web_ui)
+                self.ui(self.refresh_channels_list)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _ytc_start_over(self, proc):
+        if self._ytc_starting is proc:
+            self._ytc_starting = None
+
+    def _ytc_exited(self, proc, log_path):
+        """Log-thread callback once 'ytc serve' has ended: says why, unless the
+        stop was asked for (Stop, Stop all, closing the window)."""
+        during_startup = self._ytc_starting is proc
+        if self.ytc_proc is proc:
+            self.ytc_proc = None
+        if not self.is_monitoring or not self._claim_exit(proc):
+            return
+        if external_stop_requested():
+            self.log("ℹ️ YTC web server stopped from outside this window (Stop_All.bat).")
+            return
+        headline = "❌ YTC web server stopped during start-up" if during_startup else "❌ YTC web server stopped"
+        # show_lines=False: the log thread has just copied those lines into the pane.
+        for line in exit_report(headline, "the web server", proc.returncode, log_path, show_lines=False):
+            self.log(line)
+        if not during_startup:
+            self.log("   | Press 'Start Server' to start it again.")
+
+    def _tail_log_file(self, log_path, proc, tag, on_exit=None):
+        """Copy new lines of a child's log file into the log pane until it exits,
+        then call on_exit() (not when the window is closing)."""
         try:
             with open(log_path, "r", encoding="utf-8", errors="replace") as f:
                 pending = ""
@@ -1332,12 +1705,23 @@ class YTCControlApp:
                             pending = ""
                         continue
                     if proc.poll() is not None:
-                        if pending.strip():
-                            self.log(f"{tag} {pending.strip()}")
+                        # What it wrote between the empty read above and its end
+                        # (often the fatal error line) is still to be copied.
+                        pending += f.read()
+                        for line in pending.splitlines():
+                            if line.strip():
+                                self.log(f"{tag} {line.strip()}")
                         break
                     time.sleep(0.25)
         except OSError as e:
             self.log(f"⚠️ Could not read {log_path}: {e}")
+        if on_exit is None or not self.is_monitoring:
+            return
+        try:
+            proc.wait()     # at once after a normal end; needed when the log could not be read
+        except Exception:
+            return
+        on_exit()
 
     def stop_ytc_server(self):
         if self._confirm_stop(stops_engine=False, stops_web=True):
@@ -1346,6 +1730,8 @@ class YTCControlApp:
     def _stop_ytc_now(self):
         self._ytc_stop_gen += 1
         proc, self.ytc_proc = self.ytc_proc, None
+        if proc is not None:
+            self._claim_exit(proc)      # a requested stop: the log thread stays silent
         _, ytc_port = self._ports()
         threading.Thread(target=self._stop_service,
                          args=("YTC web server", proc, ytc_port, "ytc.exe"), daemon=True).start()
@@ -1378,6 +1764,22 @@ class YTCControlApp:
 
     def on_close(self):
         """Window close: ask whether the background services should stop too."""
+        setup = self.setup_dialog
+        if setup is not None and setup.busy and setup.alive():
+            if not messagebox.askokcancel(
+                    "Setup still working",
+                    "The setup is still downloading or installing.\n\nClosing the window cancels it. What was "
+                    "downloaded so far is kept and continues next time. Close anyway?",
+                    icon="warning", default="cancel"):
+                return
+            # Cancel properly: the install ends its pip / cargo / download step
+            # (and the programs it started) instead of dying with this process.
+            setup.then_start = False
+            setup.cancel.set()
+            self.root.config(cursor="watch")
+            self.root.update_idletasks()
+            setup.install_done.wait(timeout=15)
+            self.root.config(cursor="")
         with self._jobs_lock:
             jobs = [p for p in self._jobs if p.poll() is None]
         if jobs and not messagebox.askokcancel(
@@ -1406,6 +1808,10 @@ class YTCControlApp:
         self.is_monitoring = False
         self._llm_stop_gen += 1
         self._ytc_stop_gen += 1
+        # Closing the window is a requested stop: no 'stopped' report for these.
+        for proc in (self.llama_proc, self.ytc_proc):
+            if proc is not None:
+                self._claim_exit(proc)
         # A crawl's output pipe dies with this window, so it cannot be left running.
         for job in jobs:
             kill_process_tree(job.pid)
@@ -1445,8 +1851,9 @@ class YTCControlApp:
         except Exception as e:
             return -1, str(e)
 
-    def _run_stream(self, cmd, tag, on_start=None):
-        """Run a long ytc command hidden and copy its output to the log pane."""
+    def _run_stream(self, cmd, tag, on_start=None, on_line=None):
+        """Run a long ytc command hidden and copy its output to the log pane
+        (and each non-empty line, stripped, to on_line)."""
         try:
             proc = subprocess.Popen(
                 cmd, cwd=str(SCRIPT_DIR), stdin=subprocess.DEVNULL,
@@ -1465,6 +1872,8 @@ class YTCControlApp:
             for line in proc.stdout:
                 if line.strip():
                     self.log(f"{tag} {line.strip()}")
+                    if on_line is not None:
+                        on_line(line.strip())
             return proc.wait()
         finally:
             with self._jobs_lock:
@@ -1536,7 +1945,7 @@ class YTCControlApp:
                 self.ui(self.add_chan_entry.delete, 0, "end")
                 self.ui(self.refresh_channels_list)
             else:
-                self.log(f"❌ Failed to add channel: {output}")
+                self.log(f"❌ Failed to add channel: {ytc_failure_text(code, output)}")
 
         threading.Thread(target=_task, daemon=True).start()
 
@@ -1558,7 +1967,7 @@ class YTCControlApp:
                 self.log("✓ Channel status toggled.")
                 self.ui(self.refresh_channels_list)
             else:
-                self.log(f"❌ Error toggling status: {output}")
+                self.log(f"❌ Error toggling status: {ytc_failure_text(code, output)}")
 
         threading.Thread(target=_task, daemon=True).start()
 
@@ -1681,7 +2090,7 @@ class YTCControlApp:
                 self.ui(self.exclude_reason_entry.delete, 0, "end")
                 self.ui(self.refresh_channels_list)
             else:
-                self.log(f"❌ The video was not disqualified (exit code {code}).")
+                self.log(f"❌ The video was not disqualified ({ytc_exit_text(code, output)}).")
 
         threading.Thread(target=_task, daemon=True).start()
 
@@ -1704,7 +2113,7 @@ class YTCControlApp:
                 self.log("   | Use 'Sync Wiki Files' to bring its page back.")
                 self.ui(self.refresh_channels_list)
             else:
-                self.log(f"❌ The video was not restored (exit code {code}).")
+                self.log(f"❌ The video was not restored ({ytc_exit_text(code, output)}).")
 
         threading.Thread(target=_task, daemon=True).start()
 
@@ -1732,7 +2141,9 @@ class YTCControlApp:
         ytc_bin, db_p = target
         cmd = self.ytc_cmd(ytc_bin, db_p, *reanalyze_args(selection, limit))
         self._reanalyze_busy = True
+        self._reanalyze_resume = None
         self.btn_reanalyze.config(text="⏳ Starting re-analysis...", fg=self.accent_orange, state="disabled")
+        progress = ReanalyzeProgress()
 
         def _task():
             code = -1
@@ -1740,10 +2151,21 @@ class YTCControlApp:
                 scope = "all selected videos" if int(limit) <= 0 else f"at most {int(limit)} videos"
                 self.log(f"♻ Re-analysis started: ytc reanalyze {selection} ({scope}). "
                          f"Long videos are read in sections; this can take a long time.")
-                code = self._run_stream(cmd, "[Reanalyse]", on_start=self._set_reanalyze_proc)
+                code = self._run_stream(cmd, "[Reanalyse]", on_start=self._set_reanalyze_proc,
+                                        on_line=progress.feed)
             finally:
                 self.reanalyze_proc = None
-                if code == 0:
+                # '--all' takes every video again: a restart without a limit
+                # would analyse the finished ones a second time.
+                resume = progress.resume_limit(selection, limit)
+                self._reanalyze_resume = resume
+                if resume:
+                    self.log(f"⏹ Re-analysis ended (exit code {code}) after {progress.done} of {progress.total} "
+                             f"video(s); they keep their new result. To continue with only the {resume} left, "
+                             f"open 'Re-analyse library...' again: it is set to '--all' with at most {resume} "
+                             f"videos (the ones analysed longest ago come first). Without that limit '--all' "
+                             f"analyses the whole library again.")
+                elif code == 0:
                     self.log("✓ Re-analysis finished. Use 'Sync Wiki Files' to update the wiki.")
                 else:
                     self.log(f"⏹ Re-analysis ended (exit code {code}). Videos finished before that keep "
@@ -1793,7 +2215,7 @@ class YTCControlApp:
             if code == 0:
                 self.log("✓ Wiki synchronized successfully!")
             else:
-                self.log(f"❌ Wiki generation error: {output}")
+                self.log(f"❌ Wiki generation error: {ytc_failure_text(code, output)}")
 
         threading.Thread(target=_task, daemon=True).start()
 
@@ -1910,7 +2332,9 @@ class ReanalyzeDialog:
         box.pack(fill="x", padx=14, pady=(10, 0))
         tk.Label(box, text="Which videos:", font=("Segoe UI", 9, "bold"), fg=app.fg_bright,
                  bg=app.bg_card, anchor="w").pack(fill="x")
-        self.selection = tk.StringVar(value=REANALYZE_SELECTIONS[0][0])
+        # After an '--all' run that ended early, the dialog continues it.
+        resume = app._reanalyze_resume
+        self.selection = tk.StringVar(value="--all" if resume else REANALYZE_SELECTIONS[0][0])
         for option, description in REANALYZE_SELECTIONS:
             tk.Radiobutton(box, text=f"{description}  [ytc reanalyze {option}]", variable=self.selection,
                            value=option, font=("Segoe UI", 9), fg=app.fg_text, bg=app.bg_card,
@@ -1921,7 +2345,7 @@ class ReanalyzeDialog:
         limit_row.pack(fill="x", pady=(6, 0))
         tk.Label(limit_row, text="At most this many videos in this run (0 = all selected):", font=("Segoe UI", 9),
                  fg=app.fg_text, bg=app.bg_card).pack(side="left")
-        self.limit_var = tk.IntVar(value=0)
+        self.limit_var = tk.IntVar(value=resume or 0)
         tk.Spinbox(limit_row, from_=0, to=100000, textvariable=self.limit_var, width=7, font=("Segoe UI", 9),
                    bg=app.bg_dark, fg=app.fg_bright, buttonbackground="#21262d").pack(side="left", padx=8)
 
@@ -1959,6 +2383,14 @@ class SetupDialog:
         self.then_start = then_start
         self.busy = False
         self.cancel = threading.Event()
+        # Set while no install step runs (cleared by start_install): closing the
+        # main window waits on it after a cancel.
+        self.install_done = threading.Event()
+        self.install_done.set()
+        # True while 'Check again' runs. Every check or install bumps _run; a
+        # result that belongs to an older run is dropped (see _finished).
+        self.checking = False
+        self._run = 0
         self._last_progress = 0.0
 
         self.win = tk.Toplevel(app.root)
@@ -2097,7 +2529,7 @@ class SetupDialog:
             tk.Label(row, text=mark, font=("Segoe UI", 10), fg=colour, bg=app.bg_card, width=3).pack(side="left", anchor="n")
             text = tk.Frame(row, bg=app.bg_card)
             text.pack(side="left", fill="x", expand=True)
-            title = item.label if item.required else f"{item.label} (optional)"
+            title = setup_row_title(item)
             tk.Label(text, text=title, font=("Segoe UI", 9, "bold"), fg=app.fg_bright, bg=app.bg_card,
                      anchor="w").pack(fill="x")
             tk.Label(text, text=item.detail, font=("Segoe UI", 8), fg=app.fg_dim, bg=app.bg_card, anchor="w",
@@ -2107,6 +2539,11 @@ class SetupDialog:
                                 bg=app.bg_card, anchor="w", cursor="hand2")
                 link.pack(fill="x")
                 link.bind("<Button-1>", lambda e, url=item.help_url: webbrowser.open(url))
+            alternative = ytc_setup.ENGINE_BUILDS.get(item.alternative_build) if not item.ok else None
+            if alternative is not None:
+                tk.Button(text, text=f"Install the {alternative.label} build anyway…", font=("Segoe UI", 8),
+                          bg="#21262d", fg=app.fg_bright, relief="flat", padx=8, pady=2,
+                          command=lambda it=item: self.choose_alternative(it)).pack(anchor="w", pady=(4, 0))
 
         installable = [i for i in self.items if not i.ok and i.can_install]
         manual = [i for i in self.items if not i.ok and i.required and not i.can_install]
@@ -2152,6 +2589,23 @@ class SetupDialog:
         self.progress["value"] = int(done * 1000 / total) if total else 0
         self.status_lbl.config(text=f"{ytc_setup.human_size(done)} of {ytc_setup.human_size(total)}" if total else "")
 
+    def choose_alternative(self, item):
+        """The engine build the setup does not recommend (CUDA 12.4 on an RTX 50
+        card whose driver is too old for 13.3): only after a warning, default No."""
+        build = ytc_setup.ENGINE_BUILDS.get(item.alternative_build)
+        if self.busy or build is None:
+            return
+        if not messagebox.askyesno(
+                f"Install the {build.label} build?",
+                f"{ytc_setup.RTX50_CUDA_12_4_WARNING}\n\n"
+                "Recommended instead: update the NVIDIA driver, then press 'Check again'.\n\n"
+                f"Install the {build.label} build anyway ({ytc_setup.human_size(build.download_bytes)})?",
+                icon="warning", default="no", parent=self.win):
+            return
+        ytc_setup.choose_alternative_build(item)
+        self.render()
+        self._append(f"{build.label} build chosen. The install button below now downloads it.")
+
     def start_install(self):
         if self.busy:
             return
@@ -2170,7 +2624,10 @@ class SetupDialog:
                 parent=self.win):
             return
         self.busy = True
+        self._run += 1
+        run = self._run
         self.cancel.clear()
+        self.install_done.clear()
         self.btn_install.config(state="disabled")
         self.btn_recheck.config(state="disabled")
         self.btn_close.config(text="Cancel")
@@ -2186,16 +2643,24 @@ class SetupDialog:
             except Exception as e:
                 traceback.print_exc()
                 errors = [f"{type(e).__name__}: {e}"]
+            finally:
+                self.install_done.set()
             fresh = ytc_setup.check_all(cfg)
-            self.app.ui(self._finished, fresh, errors)
+            self.app.ui(self._finished, fresh, errors, run)
 
         threading.Thread(target=_work, daemon=True).start()
 
-    def _finished(self, items, errors):
+    def _finished(self, items, errors, run=None):
+        if run is not None and run != self._run:
+            # A 'Check again' overtaken by an install started meanwhile: its
+            # result is older than the install and must not end the busy state.
+            return
         self.busy = False
+        self.checking = False
         self.items = items
         if not self.alive():
-            self.app.setup_dialog = None
+            if self.app.setup_dialog is self:
+                self.app.setup_dialog = None
             return
         self.btn_recheck.config(state="normal")
         self.btn_close.config(text="Close")
@@ -2209,18 +2674,32 @@ class SetupDialog:
             if self.then_start:
                 self.then_start = False
                 self.win.destroy()
-                self.app.setup_dialog = None
+                if self.app.setup_dialog is self:
+                    self.app.setup_dialog = None
                 self.app.start_all_services()
 
     def recheck(self):
-        if self.busy:
+        if self.busy or self.checking:
             return
+        self.checking = True
+        self._run += 1
+        run = self._run
+        # No install while the check runs: its result would end the install's
+        # busy state (see _finished).
+        self.btn_install.config(state="disabled")
+        self.btn_recheck.config(state="disabled")
         self.status_lbl.config(text="Checking...")
         cfg = self.app.cfg
+        items = self.items
 
         def _work():
-            fresh = ytc_setup.check_all(cfg)
-            self.app.ui(self._finished, fresh, [])
+            fresh, errors = items, []
+            try:
+                fresh = ytc_setup.check_all(cfg)
+            except Exception as e:
+                traceback.print_exc()
+                errors = [f"The check failed: {type(e).__name__}: {e}"]
+            self.app.ui(self._finished, fresh, errors, run)
 
         threading.Thread(target=_work, daemon=True).start()
 
@@ -2233,7 +2712,8 @@ class SetupDialog:
         start_anyway = self.then_start
         self.then_start = False
         self.win.destroy()
-        self.app.setup_dialog = None
+        if self.app.setup_dialog is self:
+            self.app.setup_dialog = None
         if start_anyway:
             # The user closed the window without fixing everything: try to start
             # anyway; whatever is still missing is reported in the log pane.
@@ -2245,7 +2725,20 @@ def main():
     os.chdir(SCRIPT_DIR)
     autostart = "--autostart" in sys.argv[1:]
 
-    if not acquire_single_instance():
+    instance = acquire_single_instance()
+    if instance == "other":
+        # The window in front is not this folder's: say so, or the user takes
+        # it for this version. Its autostart request would never be read.
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "Another YTC Control Center is already open and has been brought to the front. It belongs to "
+            "another app folder or to an older version.\n\nOnly one Control Center can run at a time (they "
+            "use the same ports). Close that one, then start this one again.\n\n"
+            f"This app folder: {SCRIPT_DIR}",
+            "YTC Control Center", 0x30 | 0x40000)    # MB_ICONWARNING | MB_TOPMOST
+        return
+    if instance != "first":
         if autostart:
             try:
                 AUTOSTART_REQUEST.write_text("1", encoding="utf-8")
@@ -2276,6 +2769,7 @@ def self_test():
     """Checks of the logic that needs no window:  python YTC_ControlCenter.pyw --self-test"""
     import tempfile
     import unittest
+    from unittest import mock
 
     class Tests(unittest.TestCase):
         def test_one_database_rule(self):
@@ -2397,6 +2891,115 @@ def self_test():
                     text = YTCControlApp._ytc_version_problem(fake, exe)
                 self.assertIn(f"does not match this app (found 9.9.9, need {need})", text)
 
+        def test_a_stopped_child_is_explained(self):
+            with tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp) / "llama-server.log"
+                # Missing log: named as empty, with the exit code explained.
+                self.assertEqual(
+                    exit_report("❌ LLM engine stopped", "the engine", 3236495362, log),
+                    ["❌ LLM engine stopped (exit code 3236495362 (0xC0E90002): Windows (Smart App Control / "
+                     "Code Integrity) blocked the engine). llama-server.log is empty: the engine stopped "
+                     "before it wrote anything."])
+                log.write_text("  \n\n", encoding="utf-8")
+                web = exit_report("❌ YTC web server stopped", "the web server", 1, log.with_name("ytc-server.log"))
+                self.assertEqual(web, ["❌ YTC web server stopped (exit code 1 (0x00000001)). ytc-server.log is "
+                                       "empty: the web server stopped before it wrote anything."])
+                self.assertIn("llama-server.log is empty: the engine",
+                              exit_report("x", "the engine", 1, log)[0])           # only blank lines
+                log.write_text("a\nb\n\nc\n", encoding="utf-8")
+                lines = exit_report("❌ LLM engine stopped during start-up", "the engine", -1073741515, log)
+                self.assertIn("(0xC0000135): a DLL is missing (usually the Microsoft Visual C++", lines[0])
+                self.assertIn("vc_redist.x64.exe", lines[0])                       # signed code normalised
+                self.assertTrue(lines[0].endswith(" Last lines of llama-server.log:"))
+                # The web server is named as itself, not as 'the engine'.
+                blocked = exit_report("❌ YTC web server stopped", "the web server", 3236495362,
+                                      log.with_name("ytc-server.log"))[0]
+                self.assertIn("blocked the web server)", blocked)
+                self.assertNotIn("the engine", blocked)
+                self.assertEqual(lines[1:], ["   | a", "   | b", "   | c"])
+                short = exit_report("❌ YTC web server stopped", "the web server", 2, log, show_lines=False)
+                self.assertEqual(len(short), 1)
+                self.assertIn(f"full log: {log}", short[0])
+
+        def test_an_engine_death_is_reported_once_and_a_requested_stop_never(self):
+            class Proc:
+                def __init__(self, code):
+                    self.returncode = code
+
+                def wait(self):
+                    return self.returncode
+
+            class Fake:
+                def __init__(self):
+                    self._exit_claimed = weakref.WeakSet()
+                    self._exit_lock = threading.Lock()
+                    self.is_monitoring = True
+                    self.llama_proc = self.ytc_proc = self._ytc_starting = None
+                    self.lines, self.asked = [], []
+                    self._offer_llm_restart = "offer"
+
+                def _claim_exit(self, proc):
+                    return YTCControlApp._claim_exit(self, proc)
+
+                def log(self, text):
+                    self.lines.append(text)
+
+                def ui(self, func, *args):
+                    self.asked.append((func, args))
+
+            with tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp) / "llama-server.log"
+                # No Stop_All.bat request (a real one in logs would change the result).
+                no_marker = mock.patch.dict(globals(), {"STOP_REQUEST": Path(tmp) / "stop.request"})
+                no_marker.start()
+                self.addCleanup(no_marker.stop)
+                fake = Fake()
+                # Stop / Stop all / closing the window claim the process first: silence.
+                stopped = Proc(1)
+                fake.llama_proc = stopped
+                self.assertTrue(fake._claim_exit(stopped))
+                YTCControlApp._watch_llm(fake, stopped, log)
+                self.assertEqual((fake.lines, fake.asked), ([], []))
+                self.assertIsNone(fake.llama_proc)
+                # An engine that stops by itself: reported once, restart offered once.
+                died = Proc(3)
+                fake.llama_proc = died
+                YTCControlApp._watch_llm(fake, died, log)
+                YTCControlApp._watch_llm(fake, died, log)
+                self.assertTrue(fake.lines[0].startswith("❌ LLM engine stopped (exit code 3 (0x00000003))."))
+                self.assertIn("llama-server.log is empty", fake.lines[0])
+                self.assertIn("Start Engine", fake.lines[-1])
+                self.assertEqual(len(fake.lines), 2)
+                self.assertEqual(fake.asked, [("offer", ("exit code 3 (0x00000003)",))])
+                self.assertIsNone(fake.llama_proc)
+                self.assertFalse(fake._claim_exit(died))
+                # The window is closing: nothing is reported.
+                fake.lines, fake.asked, fake.is_monitoring = [], [], False
+                YTCControlApp._watch_llm(fake, Proc(5), log)
+                self.assertEqual((fake.lines, fake.asked), ([], []))
+
+                # ytc.exe: the log thread's callback names start-up deaths as such.
+                fake = Fake()
+                web_log = Path(tmp) / "ytc-server.log"
+                early = Proc(2)
+                fake._ytc_starting = fake.ytc_proc = early
+                YTCControlApp._ytc_exited(fake, early, web_log)
+                YTCControlApp._ytc_exited(fake, early, web_log)
+                self.assertEqual(len(fake.lines), 1)
+                self.assertIn("❌ YTC web server stopped during start-up (exit code 2", fake.lines[0])
+                self.assertIn("ytc-server.log is empty: the web server stopped", fake.lines[0])
+                self.assertIsNone(fake.ytc_proc)
+                later = Proc(1)
+                fake.lines, fake._ytc_starting, fake.ytc_proc = [], None, later
+                YTCControlApp._ytc_exited(fake, later, web_log)
+                self.assertTrue(fake.lines[0].startswith("❌ YTC web server stopped (exit code 1"))
+                self.assertIn("Start Server", fake.lines[-1])
+                asked_to_stop = Proc(1)
+                fake.lines = []
+                fake._claim_exit(asked_to_stop)
+                YTCControlApp._ytc_exited(fake, asked_to_stop, web_log)
+                self.assertEqual(fake.lines, [])
+
         def test_settings_of_the_control_center_are_always_passed(self):
             env = {"YTC_MAX_SLOP": "60", "YTC_WIKI_DIR": "elsewhere", "YTC_DB": "other.db"}
             cmd = build_ytc_cmd("ytc.exe", "data/ytc.db", ("crawl", "--limit", 3), 8080, 45, "wiki", env=env)
@@ -2420,6 +3023,228 @@ def self_test():
             self.assertEqual(cfg["ytc"]["wiki_dir"], "wiki")
             self.assertEqual(cfg["llm"]["port"], 8080)
             self.assertEqual(cfg["extra"], 1)
+
+        def test_a_stop_from_outside_is_no_crash(self):
+            class Proc:
+                def __init__(self, code):
+                    self.returncode = code
+
+                def wait(self):
+                    return self.returncode
+
+            class Fake:
+                def __init__(self):
+                    self._exit_claimed = weakref.WeakSet()
+                    self._exit_lock = threading.Lock()
+                    self.is_monitoring = True
+                    self.llama_proc = self.ytc_proc = self._ytc_starting = None
+                    self.lines, self.asked = [], []
+                    self._offer_llm_restart = "offer"
+
+                def _claim_exit(self, proc):
+                    return YTCControlApp._claim_exit(self, proc)
+
+                def log(self, text):
+                    self.lines.append(text)
+
+                def ui(self, func, *args):
+                    self.asked.append((func, args))
+
+            with tempfile.TemporaryDirectory() as tmp:
+                marker = Path(tmp) / "stop.request"
+                with mock.patch.dict(globals(), {"STOP_REQUEST": marker}):
+                    log = Path(tmp) / "llama-server.log"
+                    # Task Manager / taskkill without Stop_All.bat: exit code 1, no restart question.
+                    fake = Fake()
+                    YTCControlApp._watch_llm(fake, Proc(1), log)
+                    self.assertEqual(fake.asked, [])
+                    self.assertTrue(fake.lines[0].startswith("ℹ️ LLM engine ended (exit code 1"))
+                    self.assertNotIn("❌", "".join(fake.lines))
+                    # Stop_All.bat left its request: neither the engine nor the web server is a crash.
+                    marker.write_text("Stop_All.bat", encoding="utf-8")
+                    self.assertTrue(external_stop_requested())
+                    fake = Fake()
+                    YTCControlApp._watch_llm(fake, Proc(3), log)
+                    self.assertEqual(fake.asked, [])
+                    self.assertEqual(fake.lines, ["ℹ️ LLM engine stopped from outside this window (Stop_All.bat)."])
+                    fake = Fake()
+                    YTCControlApp._ytc_exited(fake, Proc(1), Path(tmp) / "ytc-server.log")
+                    self.assertEqual(fake.lines, ["ℹ️ YTC web server stopped from outside this window (Stop_All.bat)."])
+                    # An old request does not count, and a new start removes it.
+                    self.assertFalse(external_stop_requested(now=time.time() + STOP_REQUEST_MAX_AGE_S + 5))
+                    clear_stop_request()
+                    self.assertFalse(marker.exists())
+                    self.assertFalse(external_stop_requested())
+                    clear_stop_request()                                    # nothing there: no error
+
+        def test_only_llama_server_counts_as_the_engine(self):
+            class Fake:
+                def __init__(self):
+                    self.llama_proc = None
+                    self._llm_start_lock = threading.Lock()
+                    self._llm_owner_checked = 0.0
+                    self._llm_owner_names = set()
+
+            module = sys.modules[__name__]
+            for names, healthy, ours in (({"open-webui.exe"}, False, False), ({"python.exe"}, True, False),
+                                         ({"llama-server.exe"}, False, True), ({"llama-server.exe"}, True, True),
+                                         (set(), True, True), (set(), False, False)):
+                pids = {pid: name for pid, name in enumerate(sorted(names), start=100)}
+                with mock.patch.object(module, "pids_listening_on", return_value=set(pids)), \
+                        mock.patch.object(module, "process_image_name", side_effect=lambda pid: pids[pid]):
+                    got = YTCControlApp._llm_port_is_ours(Fake(), 8080, unknown_is_ours=healthy)
+                self.assertEqual(got, ours, (names, healthy))
+
+        def test_a_broken_config_is_named_and_kept(self):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "config.json"
+                # Saved with a byte order mark (PowerShell 5.1, Notepad 'UTF-8 with BOM').
+                path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"llm": {"port": 8090}}).encode("utf-8"))
+                problems = []
+                self.assertEqual(load_config(path, problems)["llm"]["port"], 8090)
+                self.assertEqual(problems, [])
+                # A typo of a hand edit: named, defaults used, the file kept as .bad before a save.
+                broken = '{"llm": {"port": 8090,}}'
+                path.write_text(broken, encoding="utf-8")
+                cfg = load_config(path, problems)
+                self.assertEqual(cfg["llm"]["port"], 8080)
+                self.assertEqual(len(problems), 1)
+                self.assertIn("config.json could not be read", problems[0])
+                self.assertTrue(save_config(cfg, path))
+                self.assertEqual((Path(tmp) / "config.json.bad").read_text(encoding="utf-8"), broken)
+                self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["llm"]["port"], 8080)
+                self.assertFalse((Path(tmp) / "config.json.tmp").exists())
+                # A good file is simply replaced.
+                (Path(tmp) / "config.json.bad").unlink()
+                self.assertTrue(save_config({"a": 1}, path))
+                self.assertFalse((Path(tmp) / "config.json.bad").exists())
+                self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"a": 1})
+
+        def test_a_stopped_reanalysis_of_all_continues_with_the_rest(self):
+            progress = ReanalyzeProgress()
+            for line in ["300 video(s) selected: every analysed video.",
+                         "\x1b[1;36mRe-analysing 300 video(s) from stored transcripts with LLM m (quality "
+                         "cutoff: slop <= 45)...\x1b[0m",
+                         "[1/300] a Title", "✓ before: 40 (kept)  ->  after: 30 (kept)",
+                         "[2/300] b Title", "✗ unchanged (40 (kept)): LLM error",
+                         "[3/300] c Title", "\x1b[32m✓\x1b[0m before: 50 (kept)  ->  after: 20 (kept)",
+                         "[4/300] d Title"]:
+                progress.feed(line)
+            self.assertEqual((progress.total, progress.done), (300, 2))
+            # Failed and unfinished videos are among the 298 left: they were analysed longest ago.
+            self.assertEqual(progress.resume_limit("--all", 0), 298)
+            self.assertIsNone(progress.resume_limit("--all", 50))              # a limit continues anyway
+            self.assertIsNone(progress.resume_limit("--analyzer heuristic", 0))
+            self.assertIsNone(ReanalyzeProgress().resume_limit("--all", 0))    # stopped before the plan
+            finished = ReanalyzeProgress()
+            finished.feed("Re-analysing 1 video(s) from stored transcripts with LLM m ...")
+            finished.feed("✓ before: 1  ->  after: 2")
+            self.assertIsNone(finished.resume_limit("--all", 0))
+            self.assertNotIn("continues with the rest", REANALYZE_EXPLANATION)
+
+        def test_a_running_web_server_of_another_app_is_not_taken(self):
+            need = ytc_setup.YTC_VERSION
+            db = SCRIPT_DIR / "data" / "ytc.db"
+            self.assertIsNone(ytc_server_mismatch({"version": need, "db_path": str(db)}, db))
+            self.assertIsNone(ytc_server_mismatch({"version": need, "db_path": "data/ytc.db"}, db))
+            self.assertIsNone(ytc_server_mismatch({"version": need, "db_path": str(db).upper()}, db))
+            old = ytc_server_mismatch({"version": "0.0.9", "db_path": str(db)}, db)
+            self.assertIn(f"it is ytc 0.0.9, this app needs {need}", old)
+            other = Path(tempfile.gettempdir()) / "other" / "ytc.db"
+            elsewhere = ytc_server_mismatch({"version": need, "db_path": str(other)}, db)
+            self.assertIn(f"it uses the database {other}", elsewhere)
+            self.assertIn("version not known", ytc_server_mismatch({"db_path": str(db)}, db))
+
+        def test_the_single_instance_names_the_app_folder(self):
+            a = instance_mutex_name(Path(tempfile.gettempdir()) / "YTC-0.1.3")
+            self.assertEqual(a, instance_mutex_name(Path(tempfile.gettempdir()) / "ytc-0.1.3"))
+            self.assertNotEqual(a, instance_mutex_name(Path(tempfile.gettempdir()) / "YTC-0.1.2"))
+            self.assertRegex(a, r"^YTC_ControlCenter_[0-9a-f]{16}$")      # no backslash: a valid name
+
+        def test_setup_rows_that_only_warn_are_not_optional(self):
+            Item = ytc_setup.Item
+            self.assertEqual(setup_row_title(Item("llama", "LLM engine", False, "", required=False)),
+                             "LLM engine (warning)")
+            self.assertEqual(setup_row_title(Item("sac", "Smart App Control", True, "", required=False)),
+                             "Smart App Control (warning)")
+            self.assertEqual(setup_row_title(Item("whisper", "Whisper", False, "", required=False)),
+                             "Whisper (optional)")
+            self.assertEqual(setup_row_title(Item("llama", "LLM engine", False, "")), "LLM engine")
+
+        def test_a_check_result_never_ends_a_running_install(self):
+            class App:
+                setup_dialog = None
+
+            class Fake:
+                def __init__(self):
+                    self.app = App()
+                    self.busy, self.checking, self._run, self.items = True, True, 2, ["old"]
+
+                def alive(self):
+                    return False
+
+            fake = Fake()
+            SetupDialog._finished(fake, ["stale"], [], 1)          # the check started before the install
+            self.assertTrue(fake.busy)
+            self.assertEqual(fake.items, ["old"])
+            newer = object()
+            fake.app.setup_dialog = newer
+            SetupDialog._finished(fake, ["fresh"], [], 2)          # the install's own result
+            self.assertFalse(fake.busy)
+            self.assertIs(fake.app.setup_dialog, newer)            # a newer window is left alone
+            fake.app.setup_dialog = fake
+            SetupDialog._finished(fake, ["fresh"], [])
+            self.assertIsNone(fake.app.setup_dialog)
+
+        def test_the_last_lines_of_a_server_are_not_lost(self):
+            class Fake:
+                is_monitoring = True
+
+                def __init__(self):
+                    self.lines = []
+
+                def log(self, text):
+                    self.lines.append(text)
+
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "ytc-server.log"
+                path.write_text("listening\n", encoding="utf-8")
+
+                class Proc:
+                    def poll(self):
+                        # The fatal line arrives after the empty read, just before the end.
+                        with open(path, "a", encoding="utf-8") as f:
+                            f.write("Error: database is locked\npartial")
+                        return 1
+
+                    def wait(self):
+                        return 1
+
+                fake, ended = Fake(), []
+                YTCControlApp._tail_log_file(fake, path, Proc(), "[Server]", on_exit=lambda: ended.append(1))
+                self.assertEqual(fake.lines, ["[Server] listening", "[Server] Error: database is locked",
+                                              "[Server] partial"])
+                self.assertEqual(ended, [1])
+
+        def test_a_failed_ytc_command_always_says_why(self):
+            self.assertEqual(ytc_failure_text(1, "Error: bad channel\n"),
+                             "Error: bad channel (exit code 1 (0x00000001))")
+            silent = ytc_failure_text(-1073741515, "")
+            self.assertIn("(0xC0000135): a DLL is missing", silent)
+            self.assertTrue(silent.endswith("; ytc.exe printed nothing"))
+            self.assertEqual(ytc_exit_text(2, "x"), "exit code 2 (0x00000002)")
+
+        def test_the_control_center_log_is_rotated(self):
+            with tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp) / "control_center.log"
+                rotate_log(log, 10)                                   # missing: nothing happens
+                log.write_text("short", encoding="utf-8")
+                rotate_log(log, 10)
+                self.assertTrue(log.exists())
+                log.write_text("x" * 11, encoding="utf-8")
+                rotate_log(log, 10)
+                self.assertFalse(log.exists())
+                self.assertEqual((Path(tmp) / "control_center.log.1").read_text(encoding="utf-8"), "x" * 11)
 
     result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests))
     return 0 if result.wasSuccessful() else 1

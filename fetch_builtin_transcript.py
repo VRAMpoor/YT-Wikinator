@@ -27,6 +27,26 @@ NO_CAPTIONS_ERRORS = {
     "NotTranslatable", "TranslationLanguageNotAvailable",
 }
 
+# Seconds each HTTP request may take to connect and between two reads.
+# youtube-transcript-api sends its requests without a timeout, and ytc waits
+# for this helper without a limit: a connection that goes silent (sleep,
+# Wi-Fi or VPN change) would otherwise hang the whole crawl.
+REQUEST_TIMEOUT_SEC = 30
+
+
+def timeout_session():
+    """A requests.Session whose requests get REQUEST_TIMEOUT_SEC unless the
+    caller passes a timeout of its own."""
+    from requests import Session
+
+    class TimeoutSession(Session):
+        def request(self, method, url, **kwargs):
+            if kwargs.get("timeout") is None:
+                kwargs["timeout"] = REQUEST_TIMEOUT_SEC
+            return super().request(method, url, **kwargs)
+
+    return TimeoutSession()
+
 
 def is_foreign_script(text: str) -> bool:
     """Returns True if the text contains a significant portion of non-Latin foreign scripts."""
@@ -65,7 +85,7 @@ def fetch_cues(video_id: str):
     """Returns the fetched transcript, or None when the video has no usable captions."""
     from youtube_transcript_api import YouTubeTranscriptApi
 
-    api = YouTubeTranscriptApi()
+    api = YouTubeTranscriptApi(http_client=timeout_session())
     try:
         transcript_list = list(api.list(video_id))
     except Exception as e:
@@ -149,5 +169,39 @@ def main():
     print(json.dumps(cues))
 
 
+def self_test() -> int:
+    """Checks without network:  python fetch_builtin_transcript.py --self-test"""
+    import unittest
+    from unittest import mock
+
+    class Tests(unittest.TestCase):
+        def test_requests_get_a_timeout(self):
+            from requests import Session
+            session = timeout_session()
+            with mock.patch.object(Session, "send", side_effect=RuntimeError("no network")) as send:
+                for call in (lambda: session.get("https://example.invalid/"),
+                             lambda: session.post("https://example.invalid/", data={})):
+                    with self.assertRaises(RuntimeError):
+                        call()
+                    self.assertEqual(send.call_args.kwargs["timeout"], REQUEST_TIMEOUT_SEC)
+                with self.assertRaises(RuntimeError):
+                    session.get("https://example.invalid/", timeout=5)
+                self.assertEqual(send.call_args.kwargs["timeout"], 5)
+
+        def test_api_uses_the_timeout_session(self):
+            from youtube_transcript_api import YouTubeTranscriptApi
+            with mock.patch.object(YouTubeTranscriptApi, "list",
+                                   side_effect=RuntimeError("no network")), \
+                    mock.patch(__name__ + ".timeout_session", wraps=timeout_session) as made:
+                with self.assertRaises(RuntimeError):
+                    fetch_cues("x")
+                made.assert_called_once()
+
+    result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests))
+    return 0 if result.wasSuccessful() else 1
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv[1:]:
+        sys.exit(self_test())
     main()

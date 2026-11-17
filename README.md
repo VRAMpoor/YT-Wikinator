@@ -158,9 +158,10 @@ flowchart TD
 ## ✅ Requirements
 
 - Windows 10 or 11 (the Control Center and the setup check are Windows-only; the `ytc` command line also builds on Linux/macOS, but that is untested)
-- NVIDIA graphics card with 8 GB VRAM or more, driver 551.61 or newer
+- NVIDIA graphics card with 8 GB VRAM or more. Cards before RTX 50 need driver 551.61 or newer; RTX 50 cards need a driver with CUDA 13.3 or newer. See *Troubleshooting* below for which engine build your card gets and how to read these numbers.
+- On Windows 11: Smart App Control not switched on (in evaluation mode the setup check only warns; that was not tested, and Windows may switch it on later). The LLM engine is not code-signed, and Smart App Control blocks it. The setup check says when it is on. Switching it off is a security trade-off that Windows may not let you undo; read *Troubleshooting → Smart App Control* first.
 - Python 3.10 to 3.14 with Tk (the python.org installer or the Microsoft Store Python), with `pythonw.exe` on `PATH`. Python 3.15 is not supported yet: faster-whisper needs onnxruntime, which had no Windows build for Python 3.15 (checked 2026-11-16). On 3.15 the app runs, but videos that must be transcribed locally (no captions, or YouTube refuses the transcript) fail.
-- [Rust](https://rustup.rs/) only if you build `ytc.exe` yourself. The setup prefers the ready-made `ytc.exe` from this project's GitHub release. That file is not code-signed, so Windows or an antivirus program may show a warning; the setup checks it against a pinned SHA-256 before using it, and you can always build it from source instead.
+- [Rust](https://rustup.rs/) only if you build `ytc.exe` yourself. The setup prefers the ready-made `ytc.exe` from this project's GitHub release when one is published for this version; otherwise it builds `ytc.exe` with `cargo`, which needs Rust. The ready-made file is not code-signed, so Windows or an antivirus program may show a warning; the setup checks it against a pinned SHA-256 before using it, and you can always build it from source instead (see *Troubleshooting*).
 
 ---
 
@@ -192,9 +193,9 @@ python ytc_setup.py --self-test  # built-in checks of the setup logic (no networ
 
 `Launch_ControlCenter.bat` and `Start_All.bat` start the app without the icon. `Stop_All.bat` stops both services; when a crawl or another long job is still running, it says so and asks first. `Open_WebUI.bat` opens the web UI on the port from `config.json` (`ytc.port`).
 
-- **Everything is inside the app folder.** The Control Center looks for `llama-server.exe` in `bin/llama`, for the model in `models/`, and for `ytc.exe` in `target/release` and then in the app folder itself. A path in `config.json` is tried first; a relative path there means inside the app folder. No other folder on the PC is searched.
+- **The app's own files are inside the app folder.** The Control Center looks for `llama-server.exe` in `bin/llama`, for the model in `models/`, and for `ytc.exe` in `target/release` and then in the app folder itself. A path in `config.json` is tried first; a relative path there means inside the app folder. No other folder on the PC is searched. Besides the Desktop shortcut, three things end up outside the app folder: the Python packages (in the Python that runs the setup, normally the one that runs the app), pip's download cache (by default `%LOCALAPPDATA%\pip\cache`, about 1.44 GB on a test PC) and the Whisper model (by default `%USERPROFILE%\.cache\huggingface\hub\models--Systran--faster-whisper-base`).
 - If something does not start, the reason is in the log pane and in `logs/control_center.log`, `logs/llama-server.log` and `logs/ytc-server.log`.
-- **`ytc.exe` and the launcher belong together.** The Control Center and the setup check compare what `ytc.exe --version` prints with the version of the app (0.1.2). A `ytc.exe` that does not match is reported in the setup check and in the log (`found X, need Y`), and the Control Center does not start it. If `ytc.exe --version` itself fails (for example while an antivirus program scans the file), that error is shown and nothing is said about the version; the next action asks again. To replace a `ytc.exe` that does not match: stop the web server and any crawl, press **SETUP CHECK** and use the install button, or run `python ytc_setup.py --install`. By hand: `cargo build --release`.
+- **`ytc.exe` and the launcher belong together.** The Control Center and the setup check compare what `ytc.exe --version` prints with the version of the app (0.1.3). A `ytc.exe` that does not match is reported in the setup check and in the log (`found X, need Y`), and the Control Center does not start it. If `ytc.exe --version` itself fails (for example while an antivirus program scans the file), that error is shown and nothing is said about the version; the next action asks again. To replace a `ytc.exe` that does not match: stop the web server and any crawl, press **SETUP CHECK** and use the install button, or run `python ytc_setup.py --install`. By hand: `cargo build --release`.
 
 ### In the Control Center
 
@@ -204,13 +205,126 @@ python ytc_setup.py --self-test  # built-in checks of the setup logic (no networ
 
 ### Moving the app to another PC
 
-The app folder is the whole app. Copy the complete folder: `data/` (your database), `models/` (the model), `bin/` (the LLM engine), `wiki/` and `config.json` travel with it.
+The app folder holds all of the app's own files. Copy the complete folder: `data/` (your database), `models/` (the model), `bin/` (the LLM engine), `wiki/` and `config.json` travel with it.
 
 1. Copy the folder to the other PC.
 2. Run `Create_Desktop_Shortcut.bat` there again.
-3. Python 3.10 to 3.14 and a current NVIDIA driver must be installed on that PC. The setup check installs the Python packages and reports anything else that is missing.
+3. Python 3.10 to 3.14 and a current NVIDIA driver must be installed on that PC. The setup check installs the Python packages and fetches the Whisper model again, and reports anything else that is missing. On Windows 11, Smart App Control must not be on there either (see *Troubleshooting*).
 
 Paths inside the app folder are stored in `config.json` as relative paths, so nothing has to be changed after the move.
+
+---
+
+## 🛠️ Troubleshooting
+
+Look for what you see. The setup check (the **SETUP CHECK** button, or `python ytc_setup.py`) finds most of these problems and says what to do. The details are in the log pane and in `logs\control_center.log` and `logs\llama-server.log`.
+
+| You see | Section below |
+|---|---|
+| `exit code 3236495362 (0xC0E90002)`, `[WinError 4551]`, or a Windows "Bad Image" box | *Smart App Control (Windows 11)* |
+| `did not answer '--version' within 60 s` | *Antivirus programs* and *Smart App Control (Windows 11)* |
+| `exit code 3221226505 (0xC0000409)`, or `nvidia-smi` says `GPU is lost` | *The engine stops right after a big question, "GPU is lost"* |
+| `exit code 3221225781 (0xC0000135)` | *"exit code 3221225781 (0xC0000135): a DLL is missing"* |
+| `driver ... is below the minimum`, or `Update the NVIDIA driver` | *The setup check says the driver is too old* |
+| `failed the integrity check` | *Check that the files are the published ones* |
+| `... is in use` | *Antivirus programs* |
+| Videos without captions transcribe slowly | *Whisper transcribes slowly (on the CPU)* |
+
+### Graphics card, driver and CUDA
+
+CUDA is NVIDIA's software that lets a program compute on the graphics card. The LLM engine (PrismML's build of llama.cpp) comes in two builds, one per CUDA version. The setup picks the build by your card and brings the CUDA runtime with it, so you do not install CUDA yourself. You only need an NVIDIA driver that is new enough.
+
+| Your card | Engine build | Driver needed |
+|---|---|---|
+| Before RTX 50 (compute capability below 12.0) | CUDA 12.4 | 551.61 or newer |
+| RTX 50 (compute capability 12.0 or higher) | CUDA 13.3 | a driver whose CUDA version is 13.3 or newer |
+
+The *compute capability* is NVIDIA's number for the chip generation, for example 8.9 on an RTX 4070 Laptop GPU and 12.0 on an RTX 5090 Laptop GPU. When it cannot be read, the setup takes the CUDA 12.4 build. With several cards, the newest one decides. To see the numbers yourself, in PowerShell or a command prompt:
+
+```powershell
+nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
+nvidia-smi -q | findstr /B CUDA
+```
+
+The first command prints the card, its compute capability and the driver version, for example `NVIDIA GeForce RTX 4070 Laptop GPU, 8.9, 621.24`. The second prints the lines that start with `CUDA`, for example `CUDA Version : 13.5`. That number is the driver's CUDA version: the newest CUDA version the driver supports.
+
+#### The setup check says the driver is too old
+
+- **You see:** the **NVIDIA graphics card** line says `driver ... is below the minimum for CUDA 12.4; install 551.61 or newer`. Or, on an RTX 50 card, the **LLM engine (llama.cpp, PrismML build) + CUDA runtime** line says `Update the NVIDIA driver (CUDA 13.3 or newer needed; ...)`, and the engine is not downloaded.
+- **Why:** the driver cannot run the engine build your card needs. On an RTX 50 card the setup check asks for a driver update too when `nvidia-smi -q` does not show the driver's CUDA version, unless a CUDA 13 engine is already installed.
+- **What to do:** update the NVIDIA driver (the setup check shows the link), then press **Check again**.
+- Only in the RTX 50 case, the setup check also shows a button **Install the CUDA 12.4 build anyway…**. It first warns that this build is known to crash on RTX 50 cards ("GPU is lost") and asks you to update the driver instead; the default answer is No. Use it only if you cannot update the driver. With a driver that supports CUDA 13.3 the button is not there.
+
+#### The engine stops right after a big question, "GPU is lost"
+
+- **You see:** the engine stops right after a big question is sent, before the answer comes. Its exit code is `3221226505 (0xC0000409)`, `llama-server.log` ends with `ggml-cuda.cu:111: CUDA error`, and `nvidia-smi` then says `GPU is lost.  Reboot the system to recover this GPU`. The web page keeps working, without the engine. Version 0.1.3 then logs `LLM engine stopped (exit code 3221226505 (0xC0000409): the engine stopped itself after an error)` and asks whether to start the engine again (this crash has not yet been seen with 0.1.3; in 0.1.2 the app did not notice it).
+- **What to do:** answer **No** when the Control Center offers to start the engine again; it cannot start until Windows has restarted. Restart Windows. Then press **SETUP CHECK**. With a CUDA 12.4 engine in `bin\llama` (from version 0.1.2, or in a folder copied from another PC), it recommends the switch to the CUDA 13.3 build (590 MB download). The install button appears once the driver supports CUDA 13.3; until then it asks for a driver update. If `llm.server_binary` in `config.json` points at a CUDA 12.4 engine, it asks you to replace that engine or remove the setting.
+- **Why (RTX 50 cards):** most likely the CUDA 12.4 engine on an RTX 50 card. On an RTX 5090 Laptop GPU it crashed 3 times in 7 situations where the first big question (a 2,122-token prompt) followed a quiet card, under several test setups. The CUDA 13.3 build of the same engine release, with the same model, passed 8 of 8 rounds of the last of these setups (3 minutes idle before each round). This is strong evidence, not proof. Other RTX 50 cards were not tested. Two power settings (NVIDIA "Prefer maximum performance", Windows PCIe power saving) also differed between the crashing and the passing runs; changing them is not a known fix.
+- **Other cards:** this crash was not seen in our tests. Restart Windows, update the NVIDIA driver, and keep `logs\llama-server.log` and `logs\control_center.log` for a report.
+
+#### "exit code 3221225781 (0xC0000135): a DLL is missing"
+
+- **You see:** the engine or `ytc.exe` does not start, with this exit code.
+- **Why:** a file the program needs is missing, usually a part of the Microsoft Visual C++ 2015-2022 runtime (x64). The engine and `ytc.exe` need it, and a fresh Windows may not have all of it. The setup check looks for its four files (`msvcp140.dll`, `vcruntime140.dll`, `vcruntime140_1.dll`, `vcomp140.dll`). When one is missing, it shows a **Microsoft Visual C++ runtime (2015-2022, x64)** line and does not download the engine until the runtime is there. This error has not appeared in our tests.
+- **What to do:** install `vc_redist.x64.exe` from https://aka.ms/vs/17/release/vc_redist.x64.exe, then press **Check again**.
+
+#### Whisper transcribes slowly (on the CPU)
+
+- **You see:** videos without captions take long to transcribe. The setup check's **GPU speed-up for Whisper (cuBLAS + cuDNN) (optional)** line is not ticked.
+- **Why:** Whisper (the local speech-to-text model) runs on the graphics card only when it finds NVIDIA's cuBLAS 12 (`cublas64_12.dll`) and cuDNN 9. Without them it uses the CPU, which works, only slower. The CUDA 12.4 engine brings `cublas64_12.dll` but not cuDNN, so cuDNN 9 always comes from the pip package. The CUDA 13.3 engine (RTX 50 cards) brings `cublas64_13.dll` and most likely neither. The line is ticked only when both pip packages (`nvidia-cublas-cu12`, `nvidia-cudnn-cu12`) are installed and their DLLs are found.
+- **What to do:** press **Download & install missing parts** in the setup window. It installs `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` (about 1.2 GB) together with any other missing parts. When the packages are present but the DLLs are not found, the line says to reinstall them into the Python that runs the app or to copy the DLLs into `bin\llama`. Whisper on the graphics card was not tested on RTX 50 cards.
+
+### Windows blocks the app (unsigned programs)
+
+A code signature is a publisher's digital stamp that Windows can check. None of this app's programs has one: not the LLM engine (`llama-server.exe` and its DLLs, from PrismML's GitHub release) and not `ytc.exe` (a ready-made file from this project's GitHub release when one is published, or built on your PC with `cargo`). So Windows cannot tell who made them. Smart App Control can block such programs (in our test it blocked the engine's DLLs, but not `ytc.exe`), and antivirus programs or Windows may warn about them. The downloads are checked against fixed checksums instead (see *Check that the files are the published ones*).
+
+#### Smart App Control (Windows 11)
+
+Smart App Control is a Windows 11 security feature. As Microsoft describes it (general Windows behaviour, not something we tested): when it is on, Windows only runs programs that are signed or that Microsoft knows as trustworthy. It has three states: on, off, and evaluation mode, in which Windows watches and may switch it on later by itself.
+
+- **You see:**
+  - The setup check shows a **Windows Smart App Control** line and does not download the engine. In evaluation mode it shows only a warning.
+  - If the engine is blocked anyway, the log says `exit code 3236495362 (0xC0E90002): Windows (Smart App Control / Code Integrity) blocked the engine` (Windows blocked one of its DLLs) or `Failed to launch llama-server: [WinError 4551] ...` (Windows blocked `llama-server.exe` itself). In both cases the setup check's text contains `Windows (Smart App Control / Code Integrity) blocked the engine`. Windows may also show a Windows Security notification.
+  - A Windows box titled `llama-server.exe - Bad Image` (the title is in your Windows language) names an engine DLL and the status `0xc0e90002`: Smart App Control blocked that DLL. Close the box. The engine then stops with exit code `3236495362 (0xC0E90002)`; if the box stayed open longer than 60 s during the setup check, the setup reports that the engine `did not answer '--version' within 60 s` instead. (Version 0.1.3 asks Windows not to show this box for the engine; that is not yet tested with Smart App Control on.)
+  - In the test of version 0.1.2 Smart App Control also blocked files of the `av` Python package that Whisper uses (`DLL load failed ...`, "An Application Control policy has blocked this file"), so the **Whisper speech model (base) (optional)** line failed too. `ytc.exe` was not blocked in that test.
+- **Where Windows records it:** Event Viewer → Applications and Services Logs → Microsoft → Windows → CodeIntegrity → Operational. Events 3033 and 3077 name the blocked file and the program that tried to load it; event 3118 is the "Smart App Control Block".
+- **To check its state:** Windows Security → App & browser control → Smart App Control settings. Or, in PowerShell:
+
+  ```powershell
+  (Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy).VerifiedAndReputablePolicyState
+  ```
+
+  `1` means on, `0` off and `2` evaluation mode.
+- **What to do:** the engine cannot run while Smart App Control is on. Weigh this before you change it: Smart App Control is a security feature that stops unknown programs, and Windows may not let you switch it back on without resetting Windows. It is your decision. If you keep it on, the web page opens and shows what is already in the database, but no new video can be judged (new videos stay pending until the engine runs), and local transcription (Whisper) may be blocked too. To switch it off: Windows Security → App & browser control → Smart App Control settings → Off. On the test PC the change took effect without a restart. Then press **SETUP CHECK** again. If the engine was already downloaded completely, the setup check tests it again and does not download it a second time.
+
+#### Antivirus programs
+
+Antivirus programs often scan new `.exe` and `.dll` files, and may move a file they do not trust into quarantine. This app was not tested with a third-party antivirus program. What the app says in these cases:
+
+- **You see:** the setup says the engine `did not answer '--version' within 60 s`. **Why:** an antivirus program may still be scanning the new files, or Windows stopped the engine with an error window. **What to do:** look for such a window, check Smart App Control, wait a moment, then press **Check again**. (For `ytc.exe`, see *`ytc.exe` and the launcher belong together* above.)
+- **You see:** the setup check reports an engine file or `ytc.exe` as missing, or `bin\llama` as incomplete, although the install had finished. **Why:** a file may have been moved to quarantine. **What to do:** restore it in your antivirus program, or press the install button to fetch it again. Whether to allow the app folder in your antivirus program is your decision; check the checksums first (next section).
+- **You see:** `... is in use ... the engine cannot be replaced` or `... could not be replaced: it is in use`. **Why:** the engine, the web server, a crawl, or another program holds the file open. **What to do:** stop the engine, the web server and any crawl, then install again.
+
+#### Check that the files are the published ones
+
+The setup checks these downloads against a SHA-256 checksum written into `ytc_setup.py`, before it unpacks or runs them:
+
+- the two zip files of the engine (the same checksums that GitHub shows on PrismML's release page),
+- the base model `Ternary-Bonsai-2-27B-PTQ1_0.gguf`,
+- the ready-made `ytc.exe`, when one is published for your version.
+
+A file that does not match is deleted, and the setup reports that it `failed the integrity check`. The Python packages (from PyPI, through pip) and the Whisper model (from Hugging Face) are not checked this way. The engine zips are deleted after a successful install. To check the model or a downloaded `ytc.exe` yourself, in the app folder:
+
+```powershell
+Get-FileHash .\models\Ternary-Bonsai-2-27B-PTQ1_0.gguf
+Get-FileHash .\ytc.exe
+```
+
+Compare the result with `MODEL_SHA256` and `YTC_EXE_SHA256` in `ytc_setup.py` (upper and lower case do not matter). `YTC_EXE_SHA256` is empty when no ready-made `ytc.exe` is published for this version. A `ytc.exe` you built yourself with `cargo` has no published checksum.
+
+#### "Windows protected your PC" (not tested)
+
+This is general Windows behaviour; it was not seen in our tests. Windows marks files that a browser downloads. If you downloaded the code as a ZIP file from GitHub instead of using `git clone`, Microsoft Defender SmartScreen may show "Windows protected your PC" when you start one of the `.bat` files. If you trust the download, you can tick **Unblock** in the ZIP file's Properties (General tab) before you unpack it, or get the code with `git clone` as in the Quick Start.
 
 ---
 
@@ -220,7 +334,8 @@ Use these steps if you do not want the automatic setup. Two components are not i
 
 ### 1. `llama.cpp` Inference Server (`llama-server`), PrismML Fork
 - The default Bonsai `PTQ1_0` model **only runs on the PrismML fork** of llama.cpp. Stock llama.cpp rejects `PTQ1_0`.
-- Download from the [PrismML-Eng/llama.cpp Releases](https://github.com/PrismML-Eng/llama.cpp/releases) (tested tag: `prism-b12128-d7b2896`): the Windows CUDA 12.4 build plus the matching `cudart` zip.
+- Download from the [PrismML-Eng/llama.cpp Releases](https://github.com/PrismML-Eng/llama.cpp/releases) (tested tag: `prism-b12128-d7b2896`): the Windows CUDA 12.4 build (`...-bin-win-cuda-12.4-x64.zip`) plus the matching `cudart-llama-bin-win-cuda-12.4-x64.zip`.
+- RTX 50 cards: take the CUDA 13.3 pair instead (`...-bin-win-cuda-13.3-x64.zip` and `cudart-llama-bin-win-cuda-13.3-x64.zip`). It needs a driver with CUDA 13.3 or newer. The CUDA 12.4 build can crash on these cards ("GPU is lost", see *Troubleshooting*).
 - Unzip both into `bin/llama/` so that `bin/llama/llama-server.exe` exists, or set `llm.server_binary` in `config.json`.
 - With stock llama.cpp, use a standard GGUF model instead (see *Alternative Models* below).
 
